@@ -1,0 +1,166 @@
+name: Ubuntu Desktop (browser VNC)
+
+# Spins up a real Ubuntu XFCE desktop on a GitHub-hosted runner and streams it
+# to your browser over HTTPS. The runner has no inbound ports, so the desktop is
+# published through a Cloudflare Quick Tunnel, which needs no account.
+#
+# The session is ephemeral: it dies when the job ends or you cancel it, and the
+# public URL stops working at that moment.
+
+on:
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: Desktop flavor
+        type: choice
+        default: ubuntu-xfce
+        options:
+          - ubuntu-xfce
+          - ubuntu-mate
+          - ubuntu-kde
+          - ubuntu-lxqt
+          - ubuntu-i3
+      session_minutes:
+        description: Session length in minutes (max 355)
+        type: number
+        default: 240
+      password:
+        description: Password (blank = use the VNC_PASSWORD secret, or auto-generate)
+        type: string
+        required: false
+      allowed_emails:
+        description: Restrict access to these emails via Cloudflare one-time PIN
+        type: string
+        required: false
+      mount_workspace:
+        description: Mount this repo's working copy at /config/workspace
+        type: boolean
+        default: true
+      cache_config:
+        description: Cache /config so installed apps and files survive the session
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+# One desktop at a time; a second run would fight over the same ports.
+concurrency:
+  group: ubuntu-desktop
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    name: Ubuntu desktop
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      # Pinned rather than left to the script's TMPDIR default, so every step
+      # agrees on where state.env lives.
+      DESKTOP_STATE_DIR: /tmp/ubuntu-desktop-vnc
+    outputs:
+      url: ${{ steps.publish.outputs.url }}
+      password: ${{ steps.publish.outputs.password }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache desktop home
+        if: inputs.cache_config
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/desktop-config
+          key: desktop-config-${{ inputs.flavor }}-${{ github.run_id }}
+          restore-keys: |
+            desktop-config-${{ inputs.flavor }}-
+
+      - name: Start desktop
+        env:
+          # Passed via env rather than interpolated into the shell body, so
+          # Actions cannot read a secret value as script injection.
+          INPUT_PASSWORD: ${{ inputs.password }}
+          SECRET_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+          FLAVOR: ${{ inputs.flavor }}
+          MOUNT_DIR: ${{ inputs.mount_workspace && github.workspace || '' }}
+          CONFIG_DIR: ${{ inputs.cache_config && '/home/runner/desktop-config' || '' }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$INPUT_PASSWORD" ]]; then
+            export PASSWORD="$INPUT_PASSWORD"
+          elif [[ -n "$SECRET_PASSWORD" ]]; then
+            export PASSWORD="$SECRET_PASSWORD"
+          fi
+          bash scripts/desktop.sh up
+
+      - name: Open public tunnel
+        env:
+          ALLOWED_MAILS: ${{ inputs.allowed_emails }}
+        run: bash scripts/desktop.sh tunnel
+
+      - name: Publish URL
+        id: publish
+        env:
+          SESSION_MINUTES: ${{ inputs.session_minutes }}
+        run: |
+          set -euo pipefail
+          source "$DESKTOP_STATE_DIR/state.env"
+
+          {
+            echo "url=$PUBLIC_URL"
+            echo "password=$PASSWORD"
+          } >>"$GITHUB_OUTPUT"
+
+          {
+            echo "## Ubuntu desktop is live"
+            echo
+            echo "### [$PUBLIC_URL]($PUBLIC_URL)"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Username | \`$VNC_USER\` |"
+            echo "| Password | \`$PASSWORD\` |"
+            echo "| Image | \`$IMAGE\` |"
+            echo "| Ends | ~$SESSION_MINUTES min from now, or when you cancel this job |"
+            echo
+            echo "Anyone with the URL can reach the login screen. Cancel the job to kill it."
+            if [[ "$PASSWORD" == "***" ]]; then
+              echo
+              echo "**The password is masked** because it came from the \`VNC_PASSWORD\`"
+              echo "repository secret and GitHub will not print it to the log. Pass a"
+              echo "password in the workflow input instead if you need to read it back."
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          echo "Desktop URL: $PUBLIC_URL"
+
+      - name: Keep session alive
+        env:
+          SESSION_MINUTES: ${{ inputs.session_minutes }}
+        run: |
+          set -euo pipefail
+          source "$DESKTOP_STATE_DIR/state.env"
+          minutes=$(( SESSION_MINUTES < 355 ? SESSION_MINUTES : 355 ))
+          end=$(( SECONDS + minutes * 60 ))
+          while (( SECONDS < end )); do
+            if ! docker inspect -f '{{.State.Running}}' "$CONTAINER" >/dev/null 2>&1; then
+              echo "::error::desktop container is gone"
+              exit 1
+            fi
+            printf 'alive, %dm remaining\n' $(( (end - SECONDS) / 60 ))
+            sleep 30
+          done
+          echo "Session window elapsed."
+
+      - name: Diagnostics
+        if: always()
+        run: |
+          echo "--- container logs (tail) ---"
+          docker logs --tail 60 ubuntu-desktop 2>&1 || true
+          echo
+          echo "--- cloudflared logs (tail) ---"
+          tail -n 30 "$DESKTOP_STATE_DIR/cloudflared.log" 2>/dev/null || true
+
+      - name: Tear down
+        if: always()
+        run: bash scripts/desktop.sh down || true
