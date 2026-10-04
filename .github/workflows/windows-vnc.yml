@@ -147,33 +147,69 @@ jobs:
           Move-Item $inner.FullName $novnc -Force
           if (-not (Test-Path "$novnc\vnc.html")) { throw "vnc.html missing from noVNC" }
 
-          # websockify serves the noVNC directory, so hitting the tunnel root
-          # lands on a file listing instead of the client. Drop an index.html
-          # that forwards to the full client, so the advertised URL opens the
-          # desktop directly. It passes host and port through as
-          # window.location.*, because vnc.html defaults its WebSocket to port
-          # 6080 when the port is not given, which is wrong once the traffic
-          # arrives through a tunnel on 443.
-          # Built as an array rather than a here-string: a here-string closing
-          # delimiter must sit at column 0, which would break the YAML block
-          # scalar this script lives in.
-          $target = 'vnc.html?host=window.location.hostname&amp;port=window.location.port&amp;autoconnect=true&amp;resize=scale'
-          $index = @(
+          # websockify serves the noVNC directory, so the tunnel root lands on a file
+          # listing rather than the client. Write our own launcher instead of
+          # redirecting to vnc.html: that page's Connect form defaults its Port
+          # field to 6080, so clicking Connect builds wss://<tunnel>:6080 and
+          # fails, because the tunnel only exposes 443. This page derives the
+          # WebSocket URL from the current location, so host and port cannot be
+          # wrong, and it supplies the password directly so there is no prompt.
+          # Built as an array, not a here-string: a here-string's closing
+          # delimiter must sit at column 0 and would break this block scalar.
+          $launcher = @(
             '<!doctype html>'
             '<html>'
             '  <head>'
             '    <meta charset="utf-8">'
-            "    <meta http-equiv=`"refresh`" content=`"0; url=$target`">"
-            '    <title>Connecting to the desktop</title>'
-            '    <style>body{font:14px system-ui,sans-serif;padding:2rem}a{color:#0645ad}</style>'
+            '    <title>Windows 11 desktop</title>'
+            '    <style>'
+            '      html,body{margin:0;height:100%;background:#111;color:#eee;'
+            '        font:14px system-ui,-apple-system,Segoe UI,sans-serif}'
+            '      #screen{width:100%;height:100%}'
+            '      #status{position:fixed;inset:0;display:flex;align-items:center;'
+            '        justify-content:center;flex-direction:column;gap:.75rem;'
+            '        text-align:center;padding:2rem}'
+            '      code{background:#000;padding:.2rem .45rem;border-radius:.25rem}'
+            '    </style>'
             '  </head>'
             '  <body>'
-            '    <p>Connecting to the desktop&hellip;</p>'
-            "    <p>If nothing happens, <a href=`"$target`">click here</a>.</p>"
+            '    <div id="screen"></div>'
+            '    <div id="status"><p id="msg">Connecting&hellip;</p>'
+            '      <noscript>This needs JavaScript.</noscript></div>'
+            '    <script type="module">'
+            '      import RFB from "./core/rfb.js";'
+            '      const msg = document.getElementById("msg");'
+            '      const status = document.getElementById("status");'
+            '      try {'
+            # Same-origin WebSocket: correct scheme and port with no guessing.
+            '        const url = new URL("websockify", window.location.href);'
+            '        url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";'
+            '        const rfb = new RFB(document.getElementById("screen"), url.href, {'
+            '          credentials: { password: "__VNC_PASSWORD__" },'
+            '        });'
+            '        rfb.scaleViewport = true;'
+            '        rfb.resizeSession = false;'
+            '        rfb.addEventListener("connect", () => { status.remove(); });'
+            '        rfb.addEventListener("credentialsrequired", () => {'
+            '          msg.textContent = "Server asked for credentials the generated password did not satisfy.";'
+            '        });'
+            '        rfb.addEventListener("desktopname", (ev) => {'
+            '          document.title = ev.detail.name || "Windows 11 desktop";'
+            '        });'
+            '        rfb.addEventListener("disconnect", (ev) => {'
+            '          msg.innerHTML = "Disconnected: " + (ev.detail.clean ? "session ended" : ev.detail.reason);'
+            '          status.style.display = "flex";'
+            '        });'
+            '      } catch (err) {'
+            '        msg.textContent = "Could not start: " + err;'
+            '      }'
+            '    </script>'
             '  </body>'
             '</html>'
           )
-          Set-Content -Path "$novnc\index.html" -Value $index -Encoding utf8
+          # Splice in the generated password so there is nothing to type.
+          ($launcher -join "`n") -replace '__VNC_PASSWORD__', $pw |
+            Set-Content -Path "$novnc\index.html" -Encoding utf8
 
           # ---------- websockify ----------
           # Install with --no-deps on purpose. websockify depends on jwcrypto,
