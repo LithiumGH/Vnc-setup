@@ -137,6 +137,40 @@ If you genuinely need a GPU, the only real answer is a rented GPU instance
 same machine as the runner. Then turn `software_render` off and pass the device
 through with `EXTRA_DOCKER_ARGS="--device /dev/dri/renderD128"`.
 
+## Mouse and keyboard
+
+Verified against the shipped client bundle (`selkies-core.js`):
+
+| Chord | Action |
+|---|---|
+| **Ctrl+Shift+X** | **Gaming mode** — this is the mouse lock you want |
+| Ctrl+Shift+F | Toggle fullscreen |
+| Ctrl+Shift+M | Toggle the sidebar (ignored while in gaming mode) |
+| Ctrl+Shift+G | Toggle gamepad |
+| Ctrl+Shift+click | Same as the active sidebar chord |
+
+**Gaming mode** is what does what you're asking. It goes fullscreen, requests
+**pointer lock** (the OS cursor disappears and the mouse is captured, so it can't
+escape the window), and calls `navigator.keyboard.lock()` to trap Tab, Alt, and
+Meta so the browser can't steal your keystrokes mid-game. Pointer lock is gated on
+`gamingMode && isStreamFullscreen && inputAttached`, so all three happen together.
+
+**Getting out:** press **Escape three times**. That's deliberate — a single press
+would drop you out by accident mid-match. Two caveats:
+
+- If your browser has no Keyboard Lock API, **one** Escape leaves gaming mode.
+- Brave blocks the Keyboard API behind Shields, so one Escape there too.
+
+Selkies detects this and shows you a notice telling you which case you're in,
+rather than leaving you stuck.
+
+Two things worth knowing:
+
+- The chords are intercepted by the browser, so they never reach the desktop.
+  Set `SELKIES_KEYBOARD_SHORTCUTS=false` if you'd rather they passed through.
+- F11 (browser fullscreen) also works and is simpler, but it does **not** give
+  you pointer lock — use Ctrl+Shift+X when you want the mouse captured.
+
 ## Security
 
 - The Quick Tunnel URL is **unguessable but public**. Anyone with it reaches the
