@@ -204,25 +204,30 @@ jobs:
           Write-Host "cloudflared: $cfVersion"
 
           $cfLog = "$work\cloudflared.log"
+          $cfErr = "$work\cf.err"
           $mailArgs = @()
           if (-not [string]::IsNullOrWhiteSpace("${{ inputs.allowed_emails }}")) {
             $mailArgs = @('--allowed-mail', '${{ inputs.allowed_emails }}')
           }
-          # Start-Process cannot express a redirect to itself, so background it.
-          $cfProc = Start-Process $cf -ArgumentList (@('tunnel','--no-autoupdate','--url',"http://127.0.0.1:$($env:HTTP_PORT)") + $mailArgs) -RedirectStandardOutput $cfLog -RedirectStandardError "$work\cf.err" -PassThru
+          # Start-Process cannot send stdout and stderr to the same file, so they
+          # are kept apart. cloudflared is a Go program and writes its log to
+          # STDERR, which is where the tunnel URL actually appears, so both files
+          # must be searched.
+          $cfProc = Start-Process $cf -ArgumentList (@('tunnel','--no-autoupdate','--url',"http://127.0.0.1:$($env:HTTP_PORT)") + $mailArgs) -RedirectStandardOutput $cfLog -RedirectStandardError $cfErr -PassThru
 
           $url = $null
           for ($i = 0; $i -lt 45; $i++) {
-            if (Test-Path $cfLog) {
-              $m = Select-String -Path $cfLog -Pattern 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' -AllMatches |
-                   ForEach-Object { $_.Matches } | ForEach-Object { $_.Value } | Select-Object -First 1
-              if ($m) { $url = "$m"; break }
+            $combined = ((Get-Content $cfLog -ErrorAction SilentlyContinue) +
+                         (Get-Content $cfErr -ErrorAction SilentlyContinue)) -join "`n"
+            if ($combined) {
+              $m = [regex]::Match($combined, 'https://[a-zA-Z0-9-]+\.trycloudflare\.com')
+              if ($m.Success) { $url = $m.Value; break }
             }
             if ($cfProc.HasExited) { break }
             Start-Sleep -Seconds 2
           }
           if (-not $url) {
-            Get-Content $cfLog, "$work\cf.err" -ErrorAction SilentlyContinue | Write-Host
+            Get-Content $cfLog, $cfErr -ErrorAction SilentlyContinue | Write-Host
             throw "cloudflared did not report a tunnel URL"
           }
           Write-Host "public URL: $url"
