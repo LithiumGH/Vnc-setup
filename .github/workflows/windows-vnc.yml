@@ -120,12 +120,26 @@ jobs:
           Write-Host "downloading TightVNC"
           Invoke-WebRequest -Uri $env:TIGHTVNC_URL -OutFile $msi -UseBasicParsing
 
-          # SET_PASSWD=1 lets us supply the password via the registry instead of
-          # an interactive prompt. SET_USRSC=0 installs the service system-wide.
+          # Loopback connections are DISABLED by default, and websockify reaches
+          # TightVNC over 127.0.0.1, so the server refuses with "Sorry, loopback
+          # connections are not enabled". ALLOWLOOPBACK enables them and
+          # LOOPBACKONLY then restricts them to localhost, so 5900 stays
+          # unreachable from the runner's network and the tunnel is the only
+          # route in.
+          #
+          # USEVNCAUTHENTICATION forces standard RFB VNC auth (security type 2).
+          # Left alone, TightVNC can offer its own proprietary types, which
+          # noVNC cannot speak.
+          #
+          # The password is written to the registry below rather than passed via
+          # VALUE_OF_PASSWORD, to keep it out of the process command line.
           Write-Host "installing TightVNC"
           $p = Start-Process msiexec.exe -ArgumentList @(
             '/i', "`"$msi`"", '/quiet', '/norestart',
-            'SET_USRSC=0', 'SET_PASSWD=1', 'SET_VIEWONLY=0', 'ACCEPT_EULA=1'
+            'SET_USRSC=0', 'SET_VIEWONLY=0', 'ACCEPT_EULA=1',
+            'SET_ALLOWLOOPBACK=1', 'VALUE_OF_ALLOWLOOPBACK=1',
+            'SET_LOOPBACKONLY=1', 'VALUE_OF_LOOPBACKONLY=1',
+            'SET_USEVNCAUTHENTICATION=1', 'VALUE_OF_USEVNCAUTHENTICATION=1'
           ) -Wait -PassThru
           if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
             throw "msiexec failed with exit code $($p.ExitCode)"
@@ -155,11 +169,11 @@ jobs:
             throw "registry Password does not match what we encoded ($rbHex vs $encHex)"
           }
           Write-Host "registry Password verified"
-          # Bind loopback only. The tunnel is the only route in, so there is no
-          # reason to expose 5900 on the runner's own interfaces.
-          Set-ItemProperty -Path $reg -Name 'LoopbackOnly'      -Value 1 -Type DWord
-          Set-ItemProperty -Path $reg -Name 'LoopbackPolicy'    -Value 1 -Type DWord
-          Set-ItemProperty -Path $reg -Name 'RfbVersion'        -Value 5 -Type DWord
+          # NOTE: loopback access is configured through the MSI properties above
+          # (SET_ALLOWLOOPBACK / SET_LOOPBACKONLY). Writing LoopbackOnly or
+          # LoopbackPolicy here does nothing: those are not TightVNC registry
+          # value names, and their absence is what left the server refusing
+          # 127.0.0.1 connections.
 
           # ---------- start the service ----------
           Write-Host "starting TightVNC service"
