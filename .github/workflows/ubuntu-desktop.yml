@@ -79,9 +79,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /home/runner/desktop-config
-          key: desktop-config-${{ inputs.flavor }}-${{ github.run_id }}
+          # Deliberately stable. Cache entries are immutable, so keying this on
+          # run_id would mint a fresh entry every run and never update any of
+          # them. /config is only a few MB, so one entry per flavor is plenty.
+          # To start clean, change the key or delete the cache in the UI.
+          key: desktop-config-${{ inputs.flavor }}
           restore-keys: |
-            desktop-config-${{ inputs.flavor }}-
+            desktop-config-
 
       - name: Start desktop
         env:

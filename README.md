@@ -48,7 +48,7 @@ includes a passwordless-sudo terminal.
 | `password` | *(blank)* | Blank uses the `VNC_PASSWORD` secret, else generates one |
 | `allowed_emails` | *(blank)* | Cloudflare one-time-PIN gate. Needs a real address and an interactive browser |
 | `mount_workspace` | `true` | Your checkout appears at `/config/workspace` |
-| `cache_config` | `true` | Caches `/config`, so installed apps survive the session |
+| `cache_config` | `true` | Caches `/config` (XFCE settings, home files — **not** installed software) |
 | `software_render` | `true` | Force llvmpipe CPU rendering. Turn off only for real GPU hardware |
 | `resolution` | `1280x720` | Pinned in software mode; must look like `WIDTHxHEIGHT` |
 
@@ -170,6 +170,61 @@ Two things worth knowing:
   Set `SELKIES_KEYBOARD_SHORTCUTS=false` if you'd rather they passed through.
 - F11 (browser fullscreen) also works and is simpler, but it does **not** give
   you pointer lock — use Ctrl+Shift+X when you want the mouse captured.
+
+## Persistent storage
+
+**GitHub-hosted runners have none.** The VM and everything on its disk are
+destroyed when the job ends. `/config` is the only volume in the image, measured
+at **4.5 MB**; `/usr` is 3.2 GB and does not survive. So match the mechanism to
+the kind of data:
+
+| You want to keep | Use | Why |
+|---|---|---|
+| **Code and config files** | **Commit to the repo** | Already mounted at `/config/workspace`. Versioned, reviewable, actually durable |
+| **XFCE settings, dotfiles** | `cache_config` | 4.5 MB, fits easily |
+| **Installed software** | **Custom image** (below) | `apt install` writes to `/usr`, which is *not* a volume and is lost |
+| **Large generated data** | `actions/upload-artifact` | Explicit round-trip, 90-day retention |
+
+**Correction to something I said earlier:** I described `cache_config` as making
+"installed apps survive". It does not. Caching `/config` cannot capture anything
+`apt` installed, because those files are in `/usr`. That claim was wrong.
+
+### Keeping your tools
+
+Bake them into an image instead of installing them each run:
+
+```dockerfile
+# Dockerfile.desktop
+FROM lscr.io/linuxserver/webtop:ubuntu-xfce
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends neofetch gimp \
+ && rm -rf /var/lib/apt/lists/*
+```
+
+Build and push it, then point the script at it:
+
+```bash
+IMAGE_REPO=ghcr.io/you/vnc-desktop FLAVOR=latest ./scripts/desktop.sh up
+```
+
+Reproducible, no state, and nothing to restore each run. This is the right answer
+for "my tools disappeared".
+
+### About `actions/cache`
+
+It is a weak fit for a mutable home directory, so know the limits:
+
+- Entries are **immutable** — you cannot update one, which is why the key above is
+  stable rather than per-run
+- Evicted after **7 days** without access, and **10 GB per repo** total
+- GitHub reserves the right to evict at any time to reclaim space
+
+Treat it as a convenience for settings, never as your only copy.
+
+### If you need real persistence
+
+A [self-hosted runner](https://docs.github.com/en/actions/hosting-your-own-runners)
+has an actual disk. Everything in this repo works unchanged against one.
 
 ## Security
 
