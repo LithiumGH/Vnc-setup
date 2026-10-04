@@ -10,7 +10,7 @@
 # Cloudflare Quick Tunnel: no account needed, and it hands back real HTTPS,
 # which Selkies requires for WebCodecs to be available in the browser.
 #
-# Commands: up | tunnel | down | status | logs | shell
+# Commands: up | tunnel | down | status | logs | shell | glinfo
 #
 set -Eeuo pipefail
 
@@ -34,6 +34,22 @@ PGID="${PGID:-1000}"
 AUDIO_FRAME_MS="${AUDIO_FRAME_MS:-2.5}"
 FRAMERATE="${FRAMERATE:-60}"
 BACKPRESSURE="${BACKPRESSURE:-30}"
+
+# Rendering.
+#
+# Neither GitHub runners nor Docker Desktop on WSL2 expose a GPU to the
+# container (WSL2 only paravirtualises NVIDIA), so llvmpipe CPU rasterisation is
+# the only realistic option. Verified in this image: Mesa 26 gives OpenGL 4.5
+# core on llvmpipe/LLVM 21 with no extra packages.
+#
+# llvmpipe costs CPU proportional to pixels and frames, so resolution is pinned
+# and the framerate is capped rather than left free. On a 2 vCPU runner that is
+# the difference between a slideshow and something playable.
+SOFTWARE_RENDER="${SOFTWARE_RENDER:-true}"
+SOFTWARE_WIDTH="${SOFTWARE_WIDTH:-1280}"
+SOFTWARE_HEIGHT="${SOFTWARE_HEIGHT:-720}"
+SOFTWARE_FRAMERATE="${SOFTWARE_FRAMERATE:-24}"
+SOFTWARE_CRF="${SOFTWARE_CRF:-30}"
 
 HTTP_PORT="${HTTP_PORT:-3000}"
 HTTPS_PORT="${HTTPS_PORT:-3001}"
@@ -91,6 +107,19 @@ container_running() {
   [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" == "true" ]]
 }
 
+# Git Bash rewrites any POSIX-looking argument into a Windows path before it
+# reaches docker.exe. That is correct for a bind mount source and completely
+# wrong for a path that must stay inside the container (a -e value such as
+# VK_ICD_FILENAMES). So: disable the rewrite wholesale, and convert the mount
+# sources ourselves. A no-op on Linux, where cygpath does not exist.
+host_path() {
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -w "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
 save_state() {
   mkdir -p "$STATE_DIR"
   {
@@ -140,8 +169,10 @@ cmd_up() {
   local image="$IMAGE_REPO:$FLAVOR"
   mkdir -p "$STATE_DIR"
 
-  if container_running; then
-    log "container '$CONTAINER' already up, recreating it"
+  # Any leftover blocks the name, not just a running one. A container left in
+  # "exited" state is what you get after a failed step or a runner restart.
+  if docker inspect "$CONTAINER" >/dev/null 2>&1; then
+    log "removing existing container '$CONTAINER'"
     docker rm -f "$CONTAINER" >/dev/null
   fi
 
@@ -163,23 +194,49 @@ cmd_up() {
     # --- latency ---
     -e "SELKIES_AUDIO_FRAME_DURATION_MS=$AUDIO_FRAME_MS"
     -e "SELKIES_BACKPRESSURE_QUEUE_SIZE=$BACKPRESSURE"
-    -e "SELKIES_FRAMERATE=$FRAMERATE"
-    -e SELKIES_ENABLE_RESIZE=true
     -e SELKIES_ENABLE_CLIPBOARD=true
     # Seamless clipboard sync triggers a paste prompt in Firefox and Safari.
     -e SELKIES_CLIPBOARD_SEAMLESS=false
   )
 
+  if [[ "$SOFTWARE_RENDER" == "true" ]]; then
+    log "software rendering: llvmpipe ${SOFTWARE_WIDTH}x${SOFTWARE_HEIGHT} @ ${SOFTWARE_FRAMERATE}fps cap"
+    args+=(
+      # Stop Selkies probing for an encode GPU that is not there.
+      -e AUTO_GPU=false
+      # Xvfb without DRI3; display capture falls back to shared memory.
+      -e DISABLE_DRI3=true
+      # Force CPU rasterisation for OpenGL, and software Vulkan via lavapipe.
+      -e LIBGL_ALWAYS_SOFTWARE=1
+      -e GALLIUM_DRIVER=llvmpipe
+      -e MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
+      -e VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json
+      # Cap rather than merely default the framerate: a "24,8-24" range lets
+      # the user lower it but stops them pinning 240fps and melting the CPU.
+      -e "SELKIES_FRAMERATE=${SOFTWARE_FRAMERATE},8-${SOFTWARE_FRAMERATE}"
+      # Higher CRF means fewer bits and less encoder work.
+      -e "SELKIES_VIDEO_CRF=$SOFTWARE_CRF"
+      # Paint-over at q90 is expensive and only matters for crisp text.
+      -e SELKIES_USE_PAINT_OVER_QUALITY=false
+      -e SELKIES_MANUAL_RESOLUTION=true
+      -e SELKIES_ENABLE_RESIZE=false
+      -e "SELKIES_MANUAL_WIDTH=$SOFTWARE_WIDTH"
+      -e "SELKIES_MANUAL_HEIGHT=$SOFTWARE_HEIGHT"
+    )
+  else
+    args+=(-e "SELKIES_FRAMERATE=$FRAMERATE")
+  fi
+
   if [[ -n "$CONFIG_DIR" ]]; then
     own_config_dir "$CONFIG_DIR"
     log "persisting /config from $CONFIG_DIR"
-    args+=(-v "$CONFIG_DIR:/config")
+    args+=(-v "$(host_path "$CONFIG_DIR"):/config")
   fi
 
   if [[ -n "$MOUNT_DIR" ]]; then
     [[ -d "$MOUNT_DIR" ]] || die "MOUNT_DIR does not exist: $MOUNT_DIR"
     log "mounting $MOUNT_DIR at /config/workspace"
-    args+=(-v "$MOUNT_DIR:/config/workspace")
+    args+=(-v "$(host_path "$MOUNT_DIR"):/config/workspace")
   fi
 
   # Intentional word splitting: EXTRA_DOCKER_ARGS is a user-supplied passthrough
@@ -204,7 +261,7 @@ cmd_up() {
   args+=("$image")
 
   log "starting container"
-  docker run "${args[@]}" >/dev/null
+  MSYS2_ARG_CONV_EXCL='*' docker run "${args[@]}" >/dev/null
 
   log "waiting for the desktop to accept connections (${READY_TIMEOUT}s)"
   local deadline=$((SECONDS + READY_TIMEOUT)) ready=0
@@ -359,7 +416,30 @@ cmd_status() {
 }
 
 cmd_logs()  { docker logs --tail "${1:-200}" "$CONTAINER"; }
-cmd_shell() { docker exec -it "$CONTAINER" /bin/bash; }
+cmd_shell() { docker exec -it "$CONTAINER" bash; }
+
+# Confirms which rasteriser is actually live inside the running desktop, rather
+# than trusting the env vars we passed in.
+cmd_glinfo() {
+  container_running || die "container '$CONTAINER' is not running"
+  # Bare "bash", not /bin/bash: Git Bash rewrites absolute POSIX paths into
+  # Windows ones when handing arguments to docker.exe.
+  docker exec "$CONTAINER" bash -lc '
+    echo "=== OpenGL renderer ==="
+    if command -v glxinfo >/dev/null 2>&1; then
+      glxinfo -B 2>/dev/null | grep -E "Device|Accelerated|OpenGL core version"
+    else
+      echo "glxinfo absent (mesa-utils not installed)"
+      echo "software driver present: $(ls /usr/lib/x86_64-linux-gnu/dri/swrast_dri.so 2>/dev/null || echo NO)"
+    fi
+    echo
+    echo "=== rendering env ==="
+    env | grep -E "LIBGL_ALWAYS_SOFTWARE|GALLIUM_DRIVER|MESA_LOADER_DRIVER|VK_ICD_FILENAMES" | sort
+    echo
+    echo "=== vcpu count ==="
+    nproc
+  '
+}
 
 usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; }
 
@@ -371,6 +451,7 @@ main() {
     status) cmd_status ;;
     logs)   cmd_logs "${2:-200}" ;;
     shell)  cmd_shell ;;
+    glinfo) cmd_glinfo ;;
     *)      usage; exit 1 ;;
   esac
 }

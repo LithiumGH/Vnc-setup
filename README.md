@@ -49,6 +49,8 @@ includes a passwordless-sudo terminal.
 | `allowed_emails` | *(blank)* | Cloudflare one-time-PIN gate. Needs a real address and an interactive browser |
 | `mount_workspace` | `true` | Your checkout appears at `/config/workspace` |
 | `cache_config` | `true` | Caches `/config`, so installed apps survive the session |
+| `software_render` | `true` | Force llvmpipe CPU rendering. Turn off only for real GPU hardware |
+| `resolution` | `1280x720` | Pinned in software mode; must look like `WIDTHxHEIGHT` |
 
 ## Using it locally
 
@@ -91,6 +93,49 @@ If that is not good enough, the runner location is the problem, not the stack. U
 a [self-hosted runner](https://docs.github.com/en/actions/hosting-your-own-runners)
 on a VPS near you, or GitHub Codespaces, and point the same script at it. That
 gets you to ~10-30 ms.
+
+## Software rendering (and gaming)
+
+There is no GPU on a GitHub runner, and there is no way to route your own GPU to
+one — it is a VM in someone else's datacenter. So the desktop renders on the CPU
+via **llvmpipe**, which the image already ships. Nothing extra to install.
+
+Verified inside the running desktop:
+
+```
+Device: llvmpipe (LLVM 21.1.8, 256 bits)
+Version: Mesa 26.0.8   GL 4.5 core profile   Accelerated: no
+456 FPS (glxgears, 8 vCPU, 1280x720)
+```
+
+When `software_render` is on, the script sets:
+
+| Setting | Value | Why |
+|---|---|---|
+| `LIBGL_ALWAYS_SOFTWARE`, `GALLIUM_DRIVER`, `MESA_LOADER_DRIVER_OVERRIDE` | `llvmpipe` | Force CPU rasterisation |
+| `VK_ICD_FILENAMES` | `lvp_icd.json` | Software **Vulkan** (lavapipe) for titles that want Vulkan |
+| `AUTO_GPU` | `false` | Stop Selkies probing for an encode GPU that isn't there |
+| `DISABLE_DRI3` | `true` | Xvfb without GPU; capture falls back to shared memory |
+| `SELKIES_MANUAL_WIDTH/HEIGHT` | `1280x720` | llvmpipe cost scales with pixel count |
+| `SELKIES_FRAMERATE` | `24,8-24` | Capped, not just defaulted, so you can't pin 240fps |
+| `SELKIES_VIDEO_CRF` | `30` | Fewer bits, less encoder work |
+| `SELKIES_USE_PAINT_OVER_QUALITY` | `false` | Paint-over at q90 is expensive for little gain |
+
+Verify it's live at any time:
+
+```bash
+./scripts/desktop.sh glinfo
+```
+
+**What this is good for.** Desktop apps, browsers, 2D games, older titles, indie
+games with modest 3D. **What it isn't:** anything modern and 3D-heavy. Note also
+that your 8-vCPU machine is not representative — Actions runners give you **2
+vCPUs**, roughly a quarter of the fill rate above.
+
+If you genuinely need a GPU, the only real answer is a rented GPU instance
+(RunPod, Vast.ai) registered as a self-hosted runner, so the GPU sits in the
+same machine as the runner. Then turn `software_render` off and pass the device
+through with `EXTRA_DOCKER_ARGS="--device /dev/dri/renderD128"`.
 
 ## Security
 

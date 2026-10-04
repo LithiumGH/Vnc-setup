@@ -40,6 +40,14 @@ on:
         description: Cache /config so installed apps and files survive the session
         type: boolean
         default: true
+      software_render:
+        description: Force llvmpipe CPU rendering (runners have no GPU)
+        type: boolean
+        default: true
+      resolution:
+        description: Desktop size, e.g. 1280x720
+        type: string
+        default: '1280x720'
 
 permissions:
   contents: read
@@ -84,8 +92,18 @@ jobs:
           FLAVOR: ${{ inputs.flavor }}
           MOUNT_DIR: ${{ inputs.mount_workspace && github.workspace || '' }}
           CONFIG_DIR: ${{ inputs.cache_config && '/home/runner/desktop-config' || '' }}
+          SOFTWARE_RENDER: ${{ inputs.software_render }}
+          RESOLUTION: ${{ inputs.resolution }}
         run: |
           set -euo pipefail
+          # "1280x720" is friendlier to type into than JSON, so translate here.
+          if [[ "$RESOLUTION" =~ ^([0-9]+)x([0-9]+)$ ]]; then
+            export SOFTWARE_WIDTH="${BASH_REMATCH[1]}"
+            export SOFTWARE_HEIGHT="${BASH_REMATCH[2]}"
+          else
+            echo "::error::resolution must look like 1280x720, got '$RESOLUTION'"
+            exit 1
+          fi
           if [[ -n "$INPUT_PASSWORD" ]]; then
             export PASSWORD="$INPUT_PASSWORD"
           elif [[ -n "$SECRET_PASSWORD" ]]; then

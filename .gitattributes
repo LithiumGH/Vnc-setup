@@ -1,0 +1,7 @@
+# A CRLF checkout of scripts/desktop.sh fails with "bad interpreter: ^M", and
+# GitHub Actions checks out on Linux, so normalise everything to LF.
+* text=auto eol=lf
+
+# These two are never valid with CRLF.
+*.sh text eol=lf
+*.yml text eol=lf
