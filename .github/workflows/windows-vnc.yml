@@ -150,27 +150,30 @@ jobs:
           # websockify serves the noVNC directory, so hitting the tunnel root
           # lands on a file listing instead of the client. Drop an index.html
           # that forwards to the full client, so the advertised URL opens the
-          # desktop directly. It also passes host/port along, because vnc.html
-          # defaults its WebSocket to port 6080 when one is not specified.
-          @'
-<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8">
-    <meta http-equiv="refresh" content="0; url=vnc.html?host=__HOST__&port=__PORT__&autoconnect=true&resize=scale">
-    <title>Redirecting to the desktop</title>
-    <style>body{font:14px system-ui,sans-serif;padding:2rem}a{color:#0645ad}</style>
-  </head>
-  <body>
-    <p>Connecting to the desktop&hellip;</p>
-    <p>If nothing happens, <a href="vnc.html?host=__HOST__&port=__PORT__&autoconnect=true&resize=scale">click here</a>.</p>
-  </body>
-</html>
-'@ | Set-Content -Path "$novnc\index.html" -Encoding utf8
-          (Get-Content "$novnc\index.html" -Raw) `
-            -replace '__HOST__', 'window.location.hostname' `
-            -replace '__PORT__', 'window.location.port' |
-            Set-Content -Path "$novnc\index.html" -Encoding utf8
+          # desktop directly. It passes host and port through as
+          # window.location.*, because vnc.html defaults its WebSocket to port
+          # 6080 when the port is not given, which is wrong once the traffic
+          # arrives through a tunnel on 443.
+          # Built as an array rather than a here-string: a here-string closing
+          # delimiter must sit at column 0, which would break the YAML block
+          # scalar this script lives in.
+          $target = 'vnc.html?host=window.location.hostname&amp;port=window.location.port&amp;autoconnect=true&amp;resize=scale'
+          $index = @(
+            '<!doctype html>'
+            '<html>'
+            '  <head>'
+            '    <meta charset="utf-8">'
+            "    <meta http-equiv=`"refresh`" content=`"0; url=$target`">"
+            '    <title>Connecting to the desktop</title>'
+            '    <style>body{font:14px system-ui,sans-serif;padding:2rem}a{color:#0645ad}</style>'
+            '  </head>'
+            '  <body>'
+            '    <p>Connecting to the desktop&hellip;</p>'
+            "    <p>If nothing happens, <a href=`"$target`">click here</a>.</p>"
+            '  </body>'
+            '</html>'
+          )
+          Set-Content -Path "$novnc\index.html" -Value $index -Encoding utf8
 
           # ---------- websockify ----------
           # Install with --no-deps on purpose. websockify depends on jwcrypto,
