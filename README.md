@@ -36,6 +36,10 @@ gh repo create --private --source=. --push   # or push to any GitHub repo
 Then **Actions → Linux Desktop (browser VNC) → Run workflow**. The job summary
 at the end of the run has the link and the password.
 
+Everything below is done by `scripts/desktop.sh` locally instead, if you'd
+rather not go through Actions. `scripts/minecraft.sh` is separate — it's only
+needed to play games, since it's the only part that wants Java installed.
+
 The repo has to exist on GitHub for Actions to run, but it can be almost empty.
 Set it private: the tunnel URL is public to anyone who has it, and the desktop
 includes a passwordless-sudo terminal.
@@ -249,6 +253,74 @@ Not theoretical — both of these bit us and are handled in the script:
 
 `desktop.sh glinfo` checks the ICD path actually exists, so a wrong guess shows
 up as `MISSING` rather than as mysteriously broken Vulkan later.
+
+### Minecraft
+
+```bash
+./scripts/desktop.sh up
+./scripts/minecraft.sh status     # cpus, free RAM, java, current preset
+./scripts/minecraft.sh deps       # install a JRE (verified: OpenJDK 21.0.12)
+./scripts/minecraft.sh options    # write CPU-tuned options.txt
+```
+
+There is **no Steam** — `/usr/local/bin/steam` in the webtop image is a shim
+(`#SELKIESSHIM`), so Proton is not an option and this is Java or nothing. Use
+[Prism Launcher](https://github.com/PrismLauncher/PrismLauncher/releases), which
+handles Microsoft accounts and installs into `/config` so the game survives
+session teardown:
+
+```bash
+./scripts/minecraft.sh launch /config/PrismLauncher
+```
+
+#### The four levers, in order of what they actually buy
+
+| # | Change | Why |
+|---|---|---|
+| 1 | **Cap FPS to the stream rate** | Uncapped, Minecraft renders 100+ fps that Selkies discards before encoding. Every one is wasted CPU taken from the encoder. Most commonly missed. |
+| 2 | **Render distance 4** | Chunk meshing dominates CPU cost and scales with the *cube* of the radius — 4 chunks is roughly a fifth the work of 12 |
+| 3 | **Shaders off, Graphics: Fast** | llvmpipe executes every shader instruction on the CPU |
+| 4 | **FOV 70 → 60** | Halving horizontal FOV roughly halves rasterised area; this costs ~27% and most players don't notice |
+
+`minecraft.sh options` writes all four, plus `simulationDistance:3`, particles
+minimal, no AO, no entity shadows, no mipmaps and no biome blending. The FPS cap
+is derived from your `render_preset`, so the two can't drift apart:
+
+| Preset | Minecraft `maxFps` |
+|---|---|
+| `quality` | 30 |
+| `balanced` | 24 |
+| `fast` | 20 |
+| `potato` | 15 |
+| `tiny` | 12 |
+
+#### JVM flags
+
+`minecraft.sh launch` sets `-Xmx1400M -XX:+UseSerialGC`. Both matter:
+
+- **The heap cap is not optional.** Minecraft's own default exceeds the memory
+  actually available in the container, so it sits in GC thrash instead. Verified
+  in the container: 1353 MiB max heap, GC reports as `Copy` (SerialGC), ~2.3 GB
+  still free afterwards.
+- **SerialGC over G1.** With a small heap on 2 vCPUs, G1's concurrent GC threads
+  are pure overhead. Confirmed `UseSerialGC = true {environment}`.
+
+#### Honest expectations
+
+Minecraft at `renderDistance:4`, Fast graphics, no shaders, 15–24 fps on
+llvmpipe is **playable but not smooth**. Multiplayer in crowds will stutter,
+because entity ticking and chunk loading spike regardless of render settings —
+those are CPU costs no graphics option touches.
+
+If you want genuinely smooth Minecraft, the fix is hardware, not settings. A
+multi-core **CPU** VM (no GPU needed) is the cheapest real improvement, because
+chunk meshing parallelises across cores and llvmpipe rasterises across cores
+too. `scripts/minecraft.sh status` prints the core count so you can see whether
+you have enough; under 4 vCPUs expect trouble.
+
+Two mods help if you have the headroom: **Sodium** (Fabric) is a large
+improvement in chunk rendering, and **OptiFine** on older versions. Both need
+their own loaders and add startup work, so they are not installed automatically.
 
 Verify it any time:
 
