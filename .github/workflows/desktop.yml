@@ -56,10 +56,20 @@ on:
         description: Force llvmpipe CPU rendering (runners have no GPU)
         type: boolean
         default: true
+      render_preset:
+        description: CPU render budget. Lower = less pixel work, smoother on weak hardware
+        type: choice
+        default: balanced
+        options:
+          - quality
+          - balanced
+          - fast
+          - potato
+          - tiny
       resolution:
-        description: Desktop size, e.g. 1280x720
+        description: Override the preset with an exact size, e.g. 1280x720 (blank = use preset)
         type: string
-        default: '1280x720'
+        default: ''
       save_packages:
         description: Snapshot newly installed packages into desktop-packages.txt and commit
         type: boolean
@@ -132,19 +142,12 @@ jobs:
           MOUNT_DIR: ${{ inputs.mount_workspace && github.workspace || '' }}
           CONFIG_DIR: ${{ inputs.cache_config && '/home/runner/desktop-config' || '' }}
           SOFTWARE_RENDER: ${{ inputs.software_render }}
+          RENDER_PRESET: ${{ inputs.render_preset }}
           RESOLUTION: ${{ inputs.resolution }}
           GPU_VENDOR: ${{ inputs.gpu }}
           USE_WAYLAND: ${{ inputs.wayland }}
         run: |
           set -euo pipefail
-          # "1280x720" is friendlier to type into than JSON, so translate here.
-          if [[ "$RESOLUTION" =~ ^([0-9]+)x([0-9]+)$ ]]; then
-            export SOFTWARE_WIDTH="${BASH_REMATCH[1]}"
-            export SOFTWARE_HEIGHT="${BASH_REMATCH[2]}"
-          else
-            echo "::error::resolution must look like 1280x720, got '$RESOLUTION'"
-            exit 1
-          fi
 
           # ---------- GPU passthrough ----------
           # With a real GPU we must not force llvmpipe, and the device has to be
@@ -166,6 +169,31 @@ jobs:
               echo "::notice::no GPU requested; using software rendering"
               ;;
           esac
+
+          # ---------- Resolution ----------
+          # The render presets exist to make CPU rasterisation affordable, so
+          # they only apply when there is no GPU. With a GPU, Selkies is better
+          # left to pick its own framerate and bitrate.
+          if [[ "$SOFTWARE_RENDER" == "true" ]]; then
+            # Blank resolution means "use the preset", which is the common case.
+            # "1280x720" is friendlier to type into than JSON, so translate it.
+            if [[ -n "$RESOLUTION" ]]; then
+              if [[ "$RESOLUTION" =~ ^([0-9]+)x([0-9]+)$ ]]; then
+                export SOFTWARE_WIDTH="${BASH_REMATCH[1]}"
+                export SOFTWARE_HEIGHT="${BASH_REMATCH[2]}"
+                echo "::notice::resolution override: ${SOFTWARE_WIDTH}x${SOFTWARE_HEIGHT} (preset $RENDER_PRESET ignored)"
+              else
+                echo "::error::resolution must look like 1280x720, got '$RESOLUTION'"
+                exit 1
+              fi
+            else
+              echo "::notice::render preset: $RENDER_PRESET"
+            fi
+          elif [[ -n "$RESOLUTION" ]] && [[ "$RESOLUTION" =~ ^([0-9]+)x([0-9]+)$ ]]; then
+            export SOFTWARE_WIDTH="${BASH_REMATCH[1]}"
+            export SOFTWARE_HEIGHT="${BASH_REMATCH[2]}"
+            echo "::notice::resolution override: ${SOFTWARE_WIDTH}x${SOFTWARE_HEIGHT}"
+          fi
           # Xvfb is a software framebuffer, so real GPU rendering needs the
           # Wayland compositor that webtop can run instead.
           if [[ "${USE_WAYLAND:-false}" == "true" ]]; then
@@ -197,7 +225,9 @@ jobs:
         id: publish
         env:
           SESSION_MINUTES: ${{ inputs.session_minutes }}
-          SOFTWARE_RENDER: ${{ inputs.software_render }}
+          # Deliberately not SOFTWARE_RENDER: step env outranks state.env, and
+          # the GPU branch rewrites it to false inside the container step. Read
+          # the value the session actually started with.
           GPU_VENDOR: ${{ inputs.gpu }}
         run: |
           set -euo pipefail
@@ -220,6 +250,11 @@ jobs:
             echo "| Image | \`$IMAGE\` |"
             echo "| Render | $( [ "$SOFTWARE_RENDER" = "true" ] && echo "software (llvmpipe)" || echo "GPU passthrough" ) |"
             echo "| GPU requested | $GPU_VENDOR |"
+            if [ "$SOFTWARE_RENDER" = "true" ]; then
+              echo "| Resolution | \`${SOFTWARE_WIDTH}x${SOFTWARE_HEIGHT}\` (browser upscales to fit) |"
+              echo "| llvmpipe threads | \`$LP_NUM_THREADS\` of \`$(nproc)\` cores |"
+              echo "| Video | \`${SOFTWARE_FRAMERATE}\` fps cap, CRF $SOFTWARE_CRF |"
+            fi
             echo "| Ends | ~$SESSION_MINUTES min from now, or when you cancel this job |"
             echo
             echo "Anyone with the URL can reach the login screen. Cancel the job to kill it."

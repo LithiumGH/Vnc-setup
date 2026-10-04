@@ -14,6 +14,13 @@
 #
 set -Eeuo pipefail
 
+# ----------------------------------------------------------------- utils ----
+# Defined before the config block because the config below validates its own
+# input and needs to be able to fail loudly rather than silently carry on.
+log()  { printf '\033[36m::\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[33m!!\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[31mxx\033[0m %s\n' "$*" >&2; exit 1; }
+
 # ---------------------------------------------------------------- config ----
 IMAGE_REPO="${IMAGE_REPO:-lscr.io/linuxserver/webtop}"
 FLAVOR="${FLAVOR:-fedora-xfce}"
@@ -46,10 +53,52 @@ BACKPRESSURE="${BACKPRESSURE:-30}"
 # and the framerate is capped rather than left free. On a 2 vCPU runner that is
 # the difference between a slideshow and something playable.
 SOFTWARE_RENDER="${SOFTWARE_RENDER:-true}"
-SOFTWARE_WIDTH="${SOFTWARE_WIDTH:-1280}"
-SOFTWARE_HEIGHT="${SOFTWARE_HEIGHT:-720}"
-SOFTWARE_FRAMERATE="${SOFTWARE_FRAMERATE:-24}"
-SOFTWARE_CRF="${SOFTWARE_CRF:-30}"
+
+# Render presets for CPU-only rasterisation.
+#
+# llvmpipe's cost is roughly pixels x frames, so resolution is by far the
+# biggest lever: 854x480 is 410k pixels against 720p's 922k, so about 55% less
+# work for the same scene. Anything set explicitly below overrides the preset.
+#
+# CSS scaling makes the browser stretch the small framebuffer to fill the
+# window, so the view stays full-screen while only the low-res pixels are ever
+# encoded. That cuts CPU and bandwidth together.
+RENDER_PRESET="${RENDER_PRESET:-balanced}"
+CSS_SCALE="${CSS_SCALE:-auto}"
+if [[ "$SOFTWARE_RENDER" == "true" ]]; then
+  case "$RENDER_PRESET" in
+    quality)   preset_w=1920; preset_h=1080; preset_fps=30; preset_crf=22; preset_css=1 ;;
+    balanced)  preset_w=1280; preset_h=720;  preset_fps=24; preset_crf=28; preset_css=1 ;;
+    fast)      preset_w=960;  preset_h=540;  preset_fps=20; preset_crf=30; preset_css=1 ;;
+    potato)    preset_w=854;  preset_h=480;  preset_fps=15; preset_crf=34; preset_css=1 ;;
+    tiny)      preset_w=640;  preset_h=360;  preset_fps=12; preset_crf=36; preset_css=1 ;;
+    *) die "RENDER_PRESET must be quality|balanced|fast|potato|tiny, got '$RENDER_PRESET'" ;;
+  esac
+else
+  # A real GPU does not need the CPU budget the presets encode, so only the
+  # desktop size carries over. Framerate and CRF are left generous, since
+  # clamping them is the presets' job and it would just hobble the GPU.
+  preset_w=1920; preset_h=1080; preset_fps=60; preset_crf=23; preset_css=0
+  log "GPU rendering: ignoring the $RENDER_PRESET CPU budget"
+fi
+
+SOFTWARE_WIDTH="${SOFTWARE_WIDTH:-$preset_w}"
+SOFTWARE_HEIGHT="${SOFTWARE_HEIGHT:-$preset_h}"
+SOFTWARE_FRAMERATE="${SOFTWARE_FRAMERATE:-$preset_fps}"
+SOFTWARE_CRF="${SOFTWARE_CRF:-$preset_crf}"
+if [[ "$CSS_SCALE" == "auto" ]]; then
+  # Below 1080p, upscale in the browser rather than paying to render more.
+  CSS_SCALE=$preset_css
+fi
+
+# llvmpipe rasterises across threads and, left alone, claims every core. The
+# H.264 encoder and the container's audio/websocket handling need CPU too, so
+# reserve one core for them rather than letting rasterisation starve the
+# encoder. On a 2 vCPU runner this is 1 thread; on an 8-core box, 7.
+if [[ -z "${LP_NUM_THREADS+x}" ]]; then
+  _cores=$(nproc 2>/dev/null || echo 1)
+  LP_NUM_THREADS=$(( _cores > 1 ? _cores - 1 : 1 ))
+fi
 
 HTTP_PORT="${HTTP_PORT:-3000}"
 HTTPS_PORT="${HTTPS_PORT:-3001}"
@@ -80,11 +129,6 @@ TUNNEL_LOG="$STATE_DIR/cloudflared.log"
 
 TUNNEL_URL=""
 TUNNEL_PID=""
-
-# ----------------------------------------------------------------- utils ----
-log()  { printf '\033[36m::\033[0m %s\n' "$*" >&2; }
-warn() { printf '\033[33m!!\033[0m %s\n' "$*" >&2; }
-die()  { printf '\033[31mxx\033[0m %s\n' "$*" >&2; exit 1; }
 
 gen_password() {
   if command -v openssl >/dev/null 2>&1; then
@@ -138,6 +182,14 @@ save_state() {
     printf 'PASSWORD=%q\n'   "$PASSWORD"
     printf 'LOCAL_URL=%q\n'  "https://127.0.0.1:$HTTPS_PORT"
     printf 'PUBLIC_URL=%q\n' "$TUNNEL_URL"
+    # Render settings, so later steps (the job summary) can report what the
+    # session actually used rather than re-deriving it from inputs.
+    printf 'SOFTWARE_RENDER=%q\n' "$SOFTWARE_RENDER"
+    printf 'SOFTWARE_WIDTH=%q\n'  "$SOFTWARE_WIDTH"
+    printf 'SOFTWARE_HEIGHT=%q\n' "$SOFTWARE_HEIGHT"
+    printf 'SOFTWARE_FRAMERATE=%q\n' "$SOFTWARE_FRAMERATE"
+    printf 'SOFTWARE_CRF=%q\n'   "$SOFTWARE_CRF"
+    printf 'LP_NUM_THREADS=%q\n' "$LP_NUM_THREADS"
   } >"$STATE_DIR/state.env.tmp"
   mv "$STATE_DIR/state.env.tmp" "$STATE_DIR/state.env"
 }
@@ -210,7 +262,16 @@ cmd_up() {
 
   if [[ "$SOFTWARE_RENDER" == "true" ]]; then
     local icd="${VULKAN_ICD:-$(vulkan_icd)}"
-    log "software rendering: llvmpipe ${SOFTWARE_WIDTH}x${SOFTWARE_HEIGHT} @ ${SOFTWARE_FRAMERATE}fps cap"
+    # Quantify the saving against 1080p so the preset is a known trade, not a
+    # guess: llvmpipe work scales with pixels x frames.
+    local px=$((SOFTWARE_WIDTH * SOFTWARE_HEIGHT))
+    local px1080=$((1920 * 1080))
+    local pct=$((px * 100 / px1080))
+    local cores
+    cores=$(nproc 2>/dev/null || echo "?")
+    log "software rendering: llvmpipe ${SOFTWARE_WIDTH}x${SOFTWARE_HEIGHT} @ ${SOFTWARE_FRAMERATE}fps"
+    log "  ${cores} vCPU, ${pct}% of 1080p pixel work per frame${LP_NUM_THREADS:+, $LP_NUM_THREADS llvmpipe threads}"
+    (( CSS_SCALE == 1 )) && log "  browser upscales the framebuffer, so the view stays full window"
     args+=(
       # Stop Selkies probing for an encode GPU that is not there.
       -e AUTO_GPU=false
@@ -232,6 +293,16 @@ cmd_up() {
       -e "SELKIES_MANUAL_WIDTH=$SOFTWARE_WIDTH"
       -e "SELKIES_MANUAL_HEIGHT=$SOFTWARE_HEIGHT"
     )
+    # Stretch the small framebuffer across the browser window instead of
+    # rendering at window size. The client scales it, so only the low-res
+    # pixels are ever encoded.
+    if [[ "$CSS_SCALE" == "1" ]]; then
+      args+=(-e SELKIES_USE_CSS_SCALING=true)
+    fi
+    # llvmpipe picks its own thread count by default; be explicit.
+    if [[ -n "$LP_NUM_THREADS" ]]; then
+      args+=(-e "LP_NUM_THREADS=$LP_NUM_THREADS")
+    fi
     # An empty VK_ICD_FILENAMES is worse than omitting it, so only pass it when
     # we resolved a real path.
     if [[ -n "$icd" ]]; then

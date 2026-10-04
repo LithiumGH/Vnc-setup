@@ -51,7 +51,8 @@ includes a passwordless-sudo terminal.
 | `mount_workspace` | `true` | Your checkout appears at `/config/workspace` |
 | `cache_config` | `true` | Caches `/config` (XFCE settings, home files — **not** installed software) |
 | `software_render` | `true` | Force llvmpipe CPU rendering. Turn off only for real GPU hardware |
-| `resolution` | `1280x720` | Pinned in software mode; must look like `WIDTHxHEIGHT` |
+| `render_preset` | `balanced` | CPU render budget. Ignored when a real GPU is passed through |
+| `resolution` | *(blank)* | Overrides the preset with an exact `WIDTHxHEIGHT`. Blank = use the preset |
 | `save_packages` | `true` | Snapshot installed packages to `desktop-packages.txt` at job end |
 
 ## Windows 11
@@ -191,10 +192,46 @@ When `software_render` is on, the script sets:
 | `VK_ICD_FILENAMES` | distro-dependent | Software **Vulkan** (lavapipe). See the note below |
 | `AUTO_GPU` | `false` | Stop Selkies probing for an encode GPU that isn't there |
 | `DISABLE_DRI3` | `true` | Xvfb without GPU; capture falls back to shared memory |
-| `SELKIES_MANUAL_WIDTH/HEIGHT` | `1280x720` | llvmpipe cost scales with pixel count |
-| `SELKIES_FRAMERATE` | `24,8-24` | Capped, not just defaulted, so you can't pin 240fps |
-| `SELKIES_VIDEO_CRF` | `30` | Fewer bits, less encoder work |
+| `SELKIES_MANUAL_WIDTH/HEIGHT` | from the preset | llvmpipe cost scales with pixel count |
+| `SELKIES_FRAMERATE` | from the preset | Capped, not just defaulted, so you can't pin 240fps |
+| `SELKIES_VIDEO_CRF` | from the preset | Fewer bits, less encoder work |
 | `SELKIES_USE_PAINT_OVER_QUALITY` | `false` | Paint-over at q90 is expensive for little gain |
+| `SELKIES_USE_CSS_SCALING` | `true` | Browser upscales the framebuffer; view still fills the window |
+| `LP_NUM_THREADS` | `nproc - 1` | llvmpipe otherwise claims every core and starves the encoder |
+
+### Render presets
+
+llvmpipe's cost is roughly **pixels × frames**, so resolution is the single
+biggest lever. Pick a preset instead of hand-tuning four values:
+
+| Preset | Size | Pixels vs 1080p | fps cap | CRF |
+|---|---|---|---|---|
+| `quality` | 1920×1080 | 100% | 30 | 22 |
+| `balanced` *(default)* | 1280×720 | 44% | 24 | 28 |
+| `fast` | 960×540 | 25% | 20 | 30 |
+| `potato` | 854×480 | 19% | 15 | 34 |
+| `tiny` | 640×360 | 11% | 12 | 36 |
+
+Two things make the low presets more than a resolution change:
+
+- **CSS scaling.** The framebuffer is rendered small and the *browser* stretches
+  it to fill the window. You keep a full-screen view while only the low-res
+  pixels are ever rasterised and encoded, so it cuts CPU and bandwidth together.
+- **Thread reservation.** llvmpipe grabs every core by default. One is held
+  back for the H.264 encoder, which otherwise starves and turns a smooth desktop
+  into stutter.
+
+Set `resolution` to an exact size to bypass the preset, or `LP_NUM_THREADS` to
+override the thread count. Both work as env vars locally:
+
+```bash
+RENDER_PRESET=potato ./scripts/desktop.sh up
+LP_NUM_THREADS=4 RENDER_PRESET=balanced ./scripts/desktop.sh up
+```
+
+**Presets are ignored when a GPU is passed through.** They exist to make CPU
+rasterisation affordable; clamping framerate and bitrate would only hobble real
+hardware, so `gpu: nvidia|amd` renders at 1080p60 with no CSS scaling.
 
 ### Distro differences that actually bite
 
@@ -373,8 +410,23 @@ through the edge. The script already retries for 50 s; if it still fails, the
 `Diagnostics` step prints the cloudflared log, which has the real error.
 
 **The desktop is slow or blank.** Check the `Diagnostics` step. Software H.264
-encoding on 2 vCPUs tops out well below 60 fps at large window sizes — shrink the
-browser window, or pin the resolution:
+encoding on 2 vCPUs tops out well below 60 fps at large window sizes. Drop to a
+cheaper preset rather than hand-tuning — `RENDER_PRESET=potato` is 19% of the
+pixel work of 1080p and the browser upscales it to fill the window:
+
+```bash
+RENDER_PRESET=potato ./scripts/desktop.sh up
+```
+
+Or pin an exact size. Note `SOFTWARE_WIDTH`/`SOFTWARE_HEIGHT` override the
+preset while leaving its fps and CRF in place:
+
+```bash
+SOFTWARE_WIDTH=1024 SOFTWARE_HEIGHT=600 ./scripts/desktop.sh up
+```
+
+The `EXTRA_SELKIES` escape hatch still works for anything the presets don't
+cover, but is SELKIES_-only and bypasses the thread reservation:
 
 ```bash
 EXTRA_SELKIES="SELKIES_MANUAL_RESOLUTION=true SELKIES_MANUAL_WIDTH=1280 SELKIES_MANUAL_HEIGHT=800" \
