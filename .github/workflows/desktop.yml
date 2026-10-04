@@ -64,6 +64,22 @@ on:
         description: Snapshot newly installed packages into desktop-packages.txt and commit
         type: boolean
         default: true
+      runner:
+        description: Runner label. Use "self-hosted, gpu" for your own GPU box
+        type: string
+        default: ubuntu-latest
+      gpu:
+        description: Pass a GPU into the desktop container
+        type: choice
+        default: 'none'
+        options:
+          - 'none'      # CPU only, llvmpipe software rendering
+          - 'nvidia'    # requires --gpus all and nvidia-container-toolkit
+          - 'amd'       # requires --device /dev/dri/renderD128
+      wayland:
+        description: Use the Wayland compositor (needed for real GPU rendering)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -76,7 +92,7 @@ concurrency:
 jobs:
   desktop:
     name: Linux desktop
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 360
     permissions:
       # Needed only to commit desktop-packages.txt back to the repo.
@@ -117,6 +133,8 @@ jobs:
           CONFIG_DIR: ${{ inputs.cache_config && '/home/runner/desktop-config' || '' }}
           SOFTWARE_RENDER: ${{ inputs.software_render }}
           RESOLUTION: ${{ inputs.resolution }}
+          GPU_VENDOR: ${{ inputs.gpu }}
+          USE_WAYLAND: ${{ inputs.wayland }}
         run: |
           set -euo pipefail
           # "1280x720" is friendlier to type into than JSON, so translate here.
@@ -127,6 +145,42 @@ jobs:
             echo "::error::resolution must look like 1280x720, got '$RESOLUTION'"
             exit 1
           fi
+
+          # ---------- GPU passthrough ----------
+          # With a real GPU we must not force llvmpipe, and the device has to be
+          # handed to the container. Leave AUTO_GPU alone so Selkies detects the
+          # encoder itself and picks NVENC or VA-API.
+          case "${GPU_VENDOR:-none}" in
+            nvidia)
+              export SOFTWARE_RENDER=false
+              export EXTRA_DOCKER_ARGS="${EXTRA_DOCKER_ARGS:-} --gpus all -e NVIDIA_DRIVER_CAPABILITIES=all"
+              echo "::notice::NVIDIA passthrough: --gpus all"
+              ;;
+            amd)
+              export SOFTWARE_RENDER=false
+              export EXTRA_DOCKER_ARGS="${EXTRA_DOCKER_ARGS:-} --device /dev/dri/renderD128"
+              export DRI_NODE=/dev/dri/renderD128
+              echo "::notice::AMD passthrough: /dev/dri/renderD128"
+              ;;
+            *)
+              echo "::notice::no GPU requested; using software rendering"
+              ;;
+          esac
+          # Xvfb is a software framebuffer, so real GPU rendering needs the
+          # Wayland compositor that webtop can run instead.
+          if [[ "${USE_WAYLAND:-false}" == "true" ]]; then
+            export PIXELFLUX_WAYLAND=true
+            echo "::notice::Wayland mode enabled (needed for GPU-accelerated rendering)"
+          fi
+
+          # A self-hosted box has a real disk, so persist there rather than
+          # through the Actions cache.
+          if [[ "${{ inputs.runner }}" == self-hosted* ]]; then
+            export CONFIG_DIR="${HOME}/.desktop-config"
+            mkdir -p "$CONFIG_DIR"
+            echo "::notice::self-hosted runner detected; persisting to $CONFIG_DIR"
+          fi
+
           if [[ -n "$INPUT_PASSWORD" ]]; then
             export PASSWORD="$INPUT_PASSWORD"
           elif [[ -n "$SECRET_PASSWORD" ]]; then
@@ -144,6 +198,7 @@ jobs:
         env:
           SESSION_MINUTES: ${{ inputs.session_minutes }}
           SOFTWARE_RENDER: ${{ inputs.software_render }}
+          GPU_VENDOR: ${{ inputs.gpu }}
         run: |
           set -euo pipefail
           source "$DESKTOP_STATE_DIR/state.env"
@@ -164,6 +219,7 @@ jobs:
             echo "| Password | \`$PASSWORD\` |"
             echo "| Image | \`$IMAGE\` |"
             echo "| Render | $( [ "$SOFTWARE_RENDER" = "true" ] && echo "software (llvmpipe)" || echo "GPU passthrough" ) |"
+            echo "| GPU requested | $GPU_VENDOR |"
             echo "| Ends | ~$SESSION_MINUTES min from now, or when you cancel this job |"
             echo
             echo "Anyone with the URL can reach the login screen. Cancel the job to kill it."
