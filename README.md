@@ -52,6 +52,7 @@ includes a passwordless-sudo terminal.
 | `cache_config` | `true` | Caches `/config` (XFCE settings, home files — **not** installed software) |
 | `software_render` | `true` | Force llvmpipe CPU rendering. Turn off only for real GPU hardware |
 | `resolution` | `1280x720` | Pinned in software mode; must look like `WIDTHxHEIGHT` |
+| `save_packages` | `true` | Snapshot installed packages to `desktop-packages.txt` at job end |
 
 ## Using it locally
 
@@ -59,10 +60,12 @@ Same script, no Actions. Useful for debugging a failure before you burn CI
 minutes.
 
 ```bash
-export FLAVOR=ubuntu-xfce CONFIG_DIR="$PWD/.desktop-config"
-./scripts/desktop.sh up        # starts the container, waits until healthy
-./scripts/desktop.sh tunnel    # prints a public https:// URL
-./scripts/desktop.sh shell     # terminal inside the desktop
+export FLAVOR=fedora-xfce CONFIG_DIR="$PWD/.desktop-config"
+./scripts/desktop.sh up         # starts the container, waits until healthy
+./scripts/desktop.sh tunnel     # prints a public https:// URL
+./scripts/desktop.sh shell      # terminal inside the desktop
+./scripts/desktop.sh glinfo     # confirm llvmpipe / Vulkan ICD
+./scripts/desktop.sh snapshot   # record newly installed packages
 ./scripts/desktop.sh logs 200
 ./scripts/desktop.sh down
 ```
@@ -203,50 +206,73 @@ Two things worth knowing:
 
 **GitHub-hosted runners have none.** The VM and everything on its disk are
 destroyed when the job ends. `/config` is the only volume in the image, measured
-at **4.5 MB**; `/usr` is 3.2 GB and does not survive. So match the mechanism to
-the kind of data:
+at **4.5 MB**; `/usr` is 3.2 GB and does not survive.
+
+So do **not** try to snapshot the filesystem. `/usr` at 3.2 GB busts GitHub's
+**100 MiB per-file limit**, and blows past both the Actions cache (10 GB/repo) and
+artifact (500 MB) quotas. It's the wrong tool.
+
+### What actually works: snapshot the package delta
+
+Instead of storing files, store **which packages were added**, then reinstall them
+next run. The manifest is tens of KB, reviewable in a diff, and reproducible.
+
+```
+Run 1:  baseline captured (914 packages in the Fedora image)
+        you install fastfetch, cowsay, sl in the desktop
+        job end -> snapshot -> commits desktop-packages.txt
+
+Run 2:  baseline captured (914 packages)
+        manifest found -> restores 4 packages automatically
+        your tools are already there
+```
+
+Verified end-to-end on `fedora-xfce`: installed three packages, destroyed the
+container, booted a fresh one, and confirmed all four (including the `yyjson`
+dependency) came back.
+
+**How to use it**
+
+- `save_packages` input (default on) commits the manifest at job end
+- `./scripts/desktop.sh snapshot` does the same thing locally
+- Edit `desktop-packages.txt` by hand to pin a specific list — the script installs
+  whatever is in it, so you can review or pre-seed it
+
+The manifest records *every* new package, dependencies included, so restore is a
+single idempotent transaction. Names only, no versions — so a base image update
+gets newer versions rather than pinning you to stale ones.
+
+### Two things to know
+
+- **Cancelling the job skips the snapshot.** The step only runs on normal
+  completion. Let the session window elapse, or run `snapshot` manually.
+- **The commit needs `contents: write`**, which the job requests. If you protect
+  `main`, the push is refused and the step logs a warning rather than failing.
+  Commit the manifest yourself, or allow GitHub Actions to write.
+
+### The other mechanisms
 
 | You want to keep | Use | Why |
 |---|---|---|
-| **Code and config files** | **Commit to the repo** | Already mounted at `/config/workspace`. Versioned, reviewable, actually durable |
+| **Code and config files** | **Commit to the repo** | Already mounted at `/config/workspace` |
 | **XFCE settings, dotfiles** | `cache_config` | 4.5 MB, fits easily |
-| **Installed software** | **Custom image** (below) | The package manager writes to `/usr`, which is *not* a volume and is lost |
-| **Large generated data** | `actions/upload-artifact` | Explicit round-trip, 90-day retention |
+| **Installed software** | `desktop-packages.txt` (above) | Tiny, reviewable, reproducible |
+| **Non-package files** (`/opt`, a binary in `/usr/local`) | Custom image | See below |
+| **Large generated data** | `actions/upload-artifact` | 90-day retention, 500 MB free |
 
-**Correction to something I said earlier:** I described `cache_config` as making
-"installed apps survive". It does not. Caching `/config` cannot capture anything
-`apt` installed, because those files are in `/usr`. That claim was wrong.
-
-### Keeping your tools
-
-Bake them into an image instead of installing them each run:
+For anything the package manager can't express, bake it into an image:
 
 ```dockerfile
-# Dockerfile.desktop
 FROM lscr.io/linuxserver/webtop:fedora-xfce
-RUN dnf install -y --nodocs neofetch gimp \
- && dnf clean all
+RUN dnf install -y --nodocs gimp inkscape && dnf clean all
 ```
-
-Build and push it, then point the script at it:
 
 ```bash
 IMAGE_REPO=ghcr.io/you/vnc-desktop FLAVOR=latest ./scripts/desktop.sh up
 ```
 
-Reproducible, no state, and nothing to restore each run. This is the right answer
-for "my tools disappeared".
-
-### About `actions/cache`
-
-It is a weak fit for a mutable home directory, so know the limits:
-
-- Entries are **immutable** — you cannot update one, which is why the key above is
-  stable rather than per-run
-- Evicted after **7 days** without access, and **10 GB per repo** total
-- GitHub reserves the right to evict at any time to reclaim space
-
-Treat it as a convenience for settings, never as your only copy.
+> Fedora 44 has **dropped `neofetch`** upstream — use `fastfetch` instead. Worth
+> remembering generally: a package that exists on Ubuntu may not exist on Fedora.
 
 ### If you need real persistence
 

@@ -10,7 +10,7 @@
 # Cloudflare Quick Tunnel: no account needed, and it hands back real HTTPS,
 # which Selkies requires for WebCodecs to be available in the browser.
 #
-# Commands: up | tunnel | down | status | logs | shell | glinfo
+# Commands: up | tunnel | down | status | logs | shell | glinfo | snapshot
 #
 set -Eeuo pipefail
 
@@ -69,6 +69,11 @@ EXTRA_SELKIES="${EXTRA_SELKIES:-}"
 # Set VULKAN_ICD="" to skip forcing the software Vulkan ICD; it is resolved in
 # cmd_up, not here, because vulkan_icd() is defined further down this file.
 VULKAN_ICD="${VULKAN_ICD-}"
+
+# Where the list of extra packages to install lives. Relative paths resolve
+# against the current directory, so running from the repo root puts this beside
+# the workflow and it can be committed for the next run.
+PACKAGE_MANIFEST="${PACKAGE_MANIFEST:-./desktop-packages.txt}"
 
 STATE_DIR="${DESKTOP_STATE_DIR:-${TMPDIR:-/tmp}/ubuntu-desktop-vnc}"
 TUNNEL_LOG="$STATE_DIR/cloudflared.log"
@@ -290,6 +295,18 @@ cmd_up() {
   done
   (( ready )) || die "timed out waiting for the desktop on port $HTTPS_PORT"
 
+  # Baseline first: whatever we restore on top of this run is exactly what the
+  # user added on top of that, which is what 'snapshot' diffs against.
+  if installed_packages >"$STATE_DIR/packages-baseline.txt" && [[ -s "$STATE_DIR/packages-baseline.txt" ]]; then
+    log "baseline: $(wc -l <"$STATE_DIR/packages-baseline.txt") packages in the base image"
+  else
+    warn "could not enumerate baseline packages; snapshot will not be accurate"
+  fi
+
+  if [[ -f "$PACKAGE_MANIFEST" ]]; then
+    install_packages "$PACKAGE_MANIFEST" || warn "continuing despite package restore failure"
+  fi
+
   save_state
   log "desktop ready at https://127.0.0.1:$HTTPS_PORT as '$VNC_USER'"
 }
@@ -455,6 +472,91 @@ vulkan_icd() {
   esac
 }
 
+# --------------------------------------------------------- packages ----
+# Persistence strategy: never try to snapshot the filesystem. /usr is 3.2 GB,
+# which busts GitHub's 100 MiB per-file limit and blows the Actions cache and
+# artifact quotas. Instead record *which packages* were added, and reinstall
+# those next run. The manifest is a few tens of KB, reviewable in a diff, and
+# reproducible.
+
+# Every installed package name, sorted, for whatever distro is in the container.
+# The full set is captured at startup as the baseline, so the difference later is
+# exactly what the user added (explicit packages plus their dependencies).
+installed_packages() {
+  docker exec "$CONTAINER" bash -lc '
+    if command -v rpm >/dev/null 2>&1; then
+      rpm -qa --qf "%{NAME}\n"
+    elif command -v dpkg-query >/dev/null 2>&1; then
+      dpkg-query -f "\${binary:Package}\n" -W
+    elif command -v pacman >/dev/null 2>&1; then
+      pacman -Qq
+    else
+      echo "unknown package manager" >&2; exit 1
+    fi' 2>/dev/null | tr -d '\r' | sed '/^$/d' | sort -u
+}
+
+install_packages() {
+  local file="$1" count
+  count=$(grep -cve '^\s*#' -e '^\s*$' "$file" || true)
+  (( count > 0 )) || { log "package manifest is empty, nothing to restore"; return 0; }
+
+  log "restoring $count package(s) from $(basename "$file") (this takes a few minutes)"
+  local pkgs
+  pkgs=$(grep -ve '^\s*#' -e '^\s*$' "$file" | tr '\n' ' ')
+
+  docker exec "$CONTAINER" bash -lc "
+    set -e
+    if command -v dnf >/dev/null 2>&1; then
+      dnf install -y --nodocs $pkgs
+    elif command -v apt-get >/dev/null 2>&1; then
+      apt-get update -qq && apt-get install -y --no-install-recommends $pkgs
+    elif command -v pacman >/dev/null 2>&1; then
+      pacman -S --noconfirm --needed $pkgs
+    else
+      echo 'no supported package manager in container' >&2; exit 1
+    fi" || {
+      warn "some packages failed to install; the desktop is still usable"
+      return 1
+    }
+  log "packages restored"
+}
+
+cmd_snapshot() {
+  container_running || die "container '$CONTAINER' is not running"
+  local baseline="$STATE_DIR/packages-baseline.txt"
+  [[ -f "$baseline" ]] || die "no baseline captured; run 'up' first in this session"
+
+  local current="$STATE_DIR/packages-current.txt"
+  installed_packages >"$current"
+  [[ -s "$current" ]] || die "could not enumerate installed packages"
+
+  # Packages present now that were not in the baseline == what the user added.
+  local added="$STATE_DIR/packages-added.txt"
+  comm -23 "$current" "$baseline" >"$added"
+
+  local count
+  count=$(grep -c . "$added" || true)
+  if (( count == 0 )); then
+    log "no new packages since startup"
+    [[ -f "$PACKAGE_MANIFEST" ]] || return 0
+  fi
+
+  local dir; dir=$(dirname "$PACKAGE_MANIFEST")
+  [[ -d "$dir" ]] || { warn "manifest dir '$dir' missing, not writing"; return 1; }
+
+  {
+    echo "# Packages added inside the desktop, reinstalled on the next run."
+    echo "# Regenerate with: ./scripts/desktop.sh snapshot"
+    echo "# One package per line; lines starting with # are ignored."
+    cat "$added"
+  } >"$PACKAGE_MANIFEST"
+
+  log "wrote $count package(s) to $PACKAGE_MANIFEST"
+  if (( count > 0 )); then
+    log "added: $(tr '\n' ' ' <"$added" | cut -c1-300)"
+  fi
+}
+
 # Confirms which rasteriser is actually live inside the running desktop, rather
 # than trusting the env vars we passed in.
 cmd_glinfo() {
@@ -500,6 +602,7 @@ main() {
     logs)   cmd_logs "${2:-200}" ;;
     shell)  cmd_shell ;;
     glinfo) cmd_glinfo ;;
+    snapshot) cmd_snapshot ;;
     *)      usage; exit 1 ;;
   esac
 }

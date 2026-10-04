@@ -60,6 +60,10 @@ on:
         description: Desktop size, e.g. 1280x720
         type: string
         default: '1280x720'
+      save_packages:
+        description: Snapshot newly installed packages into desktop-packages.txt and commit
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -74,6 +78,9 @@ jobs:
     name: Linux desktop
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    permissions:
+      # Needed only to commit desktop-packages.txt back to the repo.
+      contents: write
     env:
       # Pinned rather than left to the script's TMPDIR default, so every step
       # agrees on where state.env lives.
@@ -187,6 +194,30 @@ jobs:
             sleep 30
           done
           echo "Session window elapsed."
+
+      - name: Snapshot installed packages
+        if: always() && inputs.save_packages
+        run: |
+          set -euo pipefail
+          # Before teardown: the container must still exist to enumerate packages.
+          if ! docker inspect -f '{{.State.Running}}' ubuntu-desktop >/dev/null 2>&1; then
+            echo "container already gone, skipping snapshot"
+            exit 0
+          fi
+          bash scripts/desktop.sh snapshot || echo "::warning::package snapshot failed"
+
+          if git diff --quiet -- desktop-packages.txt 2>/dev/null &&
+             git ls-files --error-unmatch desktop-packages.txt >/dev/null 2>&1; then
+            echo "manifest unchanged, nothing to commit"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add desktop-packages.txt
+          git commit -q -m "desktop: record installed packages for reuse" || {
+            echo "nothing staged, skipping commit"; exit 0; }
+          git push origin HEAD:${{ github.ref_name }} || echo "::warning::push failed (may need a PR)"
+          echo "manifest committed"
 
       - name: Diagnostics
         if: always()

@@ -1,0 +1,7 @@
+# Packages added inside the desktop, reinstalled on the next run.
+# Regenerate with: ./scripts/desktop.sh snapshot
+# One package per line; lines starting with # are ignored.
+cowsay
+fastfetch
+sl
+yyjson
