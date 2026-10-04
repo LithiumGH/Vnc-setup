@@ -295,14 +295,15 @@ if (-not $up) {
 Write-Host "noVNC served locally on $($env:HTTP_PORT)"
 
 # ---------- prove RFB and the password, inside CI ----------
-# The browser only reports "connection closed", which cannot be told
-# apart from a rejected password. Speak RFB to TightVNC directly so
-# the real cause is named: which security types it offers, and whether
-# the challenge/response is accepted.
-# Try both DES key conventions and let the server say which it wants.
-# Classic VNC bit-reverses each key byte; WebCrypto (used by noVNC) takes the
-# raw bytes. The previous checker decrypted the challenge instead of
-# encrypting it, so its REJECTED verdict proved nothing.
+# The browser only reports "connection closed", which cannot be told apart
+# from a rejected password. Speak RFB to TightVNC directly so the real cause
+# is named.
+#
+# Try both DES key conventions and let the server say which it wants. Classic
+# VNC bit-reverses each key byte; WebCrypto (used by noVNC's genDES) takes the
+# raw bytes. The first version of this checker decrypted the challenge instead
+# of encrypting it, so its REJECTED verdict proved nothing.
+$rfbScript = "$work\vnccheck.py"
 $rfbPy = @(
   '"""Try both RFB DES key conventions and report which the server accepts.'
   'The classic VNC DES (vncauth.c) bit-reverses each key byte; WebCrypto''s'
