@@ -101,15 +101,20 @@ Invoke-WebRequest -Uri $env:TIGHTVNC_URL -OutFile $msi -UseBasicParsing
 # Left alone, TightVNC can offer its own proprietary types, which
 # noVNC cannot speak.
 #
-# The password is written to the registry below rather than passed via
-# VALUE_OF_PASSWORD, to keep it out of the process command line.
+# The password is supplied to the installer as well as written to the registry
+# below. VALUE_OF_PASSWORD takes it in plaintext and TightVNC encrypts it
+# itself, so the service starts with the right password rather than an empty
+# default it would then cache. It appears in the msiexec command line, which
+# is acceptable here: the runner is ephemeral and the password is printed to
+# the job summary regardless.
 Write-Host "installing TightVNC"
 $p = Start-Process msiexec.exe -ArgumentList @(
   '/i', "`"$msi`"", '/quiet', '/norestart',
   'SET_USRSC=0', 'SET_VIEWONLY=0', 'ACCEPT_EULA=1',
   'SET_ALLOWLOOPBACK=1', 'VALUE_OF_ALLOWLOOPBACK=1',
   'SET_LOOPBACKONLY=1', 'VALUE_OF_LOOPBACKONLY=1',
-  'SET_USEVNCAUTHENTICATION=1', 'VALUE_OF_USEVNCAUTHENTICATION=1'
+  'SET_USEVNCAUTHENTICATION=1', 'VALUE_OF_USEVNCAUTHENTICATION=1',
+  'SET_PASSWORD=1', "VALUE_OF_PASSWORD=$pw"
 ) -Wait -PassThru
 if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
   throw "msiexec failed with exit code $($p.ExitCode)"
@@ -146,12 +151,21 @@ Write-Host "registry Password verified"
 # 127.0.0.1 connections.
 
 # ---------- start the service ----------
-Write-Host "starting TightVNC service"
+# The installer already started tvnserver, and it reads its configuration only at
+# startup. Calling Start-Service on a running service does nothing, so the
+# password written above was never loaded and the server rejected every login.
+# Stop it first so the restart picks the registry up.
+Write-Host "restarting TightVNC so it re-reads the registry"
 $svc = Get-Service -Name 'tvnserver' -ErrorAction SilentlyContinue
 if (-not $svc) { throw "tvnserver service was not created" }
+if ($svc.Status -ne 'Stopped') {
+  Stop-Service -Name 'tvnserver' -Force
+  (Get-Service -Name 'tvnserver').WaitForStatus('Stopped', [TimeSpan]::FromSeconds(45))
+}
 if ($svc.StartType -ne 'Automatic') { Set-Service -Name 'tvnserver' -StartupType Automatic }
 Start-Service -Name 'tvnserver'
 (Get-Service -Name 'tvnserver').WaitForStatus('Running', [TimeSpan]::FromSeconds(45))
+Write-Host ("tvnserver state: " + (Get-Service -Name 'tvnserver').Status)
 
 # Confirm it is actually listening before building anything on top.
 $listening = $false
