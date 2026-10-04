@@ -147,11 +147,31 @@ jobs:
           if (-not (Test-Path "$novnc\vnc.html")) { throw "vnc.html missing from noVNC" }
 
           # ---------- websockify ----------
-          Write-Host "installing websockify"
-          python -m pip install --quiet --disable-pip-version-check websockify
-          # Verify it imports before we depend on it.
-          python -c "import websockify; print('websockify', websockify.__version__)"
-          if ($LASTEXITCODE -ne 0) { throw "websockify import failed" }
+          # Install with --no-deps on purpose. websockify depends on jwcrypto,
+          # which depends on cryptography, and cryptography publishes NO
+          # win_arm64 wheels at all. A normal install therefore falls back to
+          # compiling it from Rust source (maturin/cargo) and dies on an ARM64
+          # runner. jwcrypto is only used for JWT token auth in
+          # token_plugins.py, which this proxy path never imports: __main__.py
+          # imports only websockify, and websockify/__init__.py imports just
+          # websocket + websocketproxy. numpy has win_arm64 wheels, so it is
+          # safe to install normally.
+          Write-Host "installing websockify (no-deps; see comment for why)"
+          $pipLog = "$work\pip.log"
+          python -m pip install --disable-pip-version-check --log "$pipLog" numpy 2>&1 |
+            Select-Object -Last 5 | Write-Host
+          if ($LASTEXITCODE -ne 0) { throw "numpy install failed (needs a win_arm64 wheel); see $pipLog" }
+          python -m pip install --disable-pip-version-check --log "$pipLog" --no-deps websockify 2>&1 |
+            Select-Object -Last 5 | Write-Host
+          if ($LASTEXITCODE -ne 0) { throw "websockify install failed; see $pipLog" }
+
+          # Exercise the real import path rather than trusting the exit code.
+          $probe = python -c "import websockify, numpy; print('websockify import OK, numpy', numpy.__version__)" 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host $probe
+            throw "websockify import failed: $probe"
+          }
+          Write-Host $probe
 
           $log = "$work\websockify.log"
           Write-Host "starting websockify on $($env:HTTP_PORT) -> $($env:VNC_PORT)"
@@ -267,7 +287,7 @@ jobs:
             Where-Object { $_.LocalPort -in @(5900, 6080) } |
             Select-Object LocalAddress, LocalPort, OwningProcess | Format-Table | Out-String | Write-Host
           $w = "${{ steps.setup.outputs.work_dir }}"
-          foreach ($f in @("cloudflared.log", "cf.err", "websockify.log", "websockify.err")) {
+          foreach ($f in @("pip.log", "cloudflared.log", "cf.err", "websockify.log", "websockify.err")) {
             if (Test-Path "$w\$f") {
               Write-Host "--- $f ---"
               Get-Content "$w\$f" -Tail 25 | Write-Host

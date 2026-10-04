@@ -102,6 +102,13 @@ guessing paths earlier returned 404.
   available locally. The PowerShell parses and the crypto is verified, but the
   TightVNC install and noVNC handshake have never run end to end. Expect to
   iterate.
+- **websockify is installed with `--no-deps`, deliberately.** Its dependency
+  chain reaches `cryptography`, which publishes **no `win_arm64` wheels at all**,
+  so a normal install tries to compile it from Rust source via maturin/cargo and
+  fails on an ARM64 runner. `jwcrypto` is only used for JWT token auth in
+  `token_plugins.py`, which this proxy path never imports — `__main__.py` imports
+  only `websockify`, and `websockify/__init__.py` imports just `websocket` and
+  `websocketproxy`. `numpy`, the one real runtime dep, does have arm64 wheels.
 - `cloudflared` has no arm64 Windows build, so amd64 runs emulated. The probe
   confirmed x86 emulation; amd64 is the same mechanism but isn't separately
   confirmed.
