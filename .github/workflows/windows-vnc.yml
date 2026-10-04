@@ -1,0 +1,288 @@
+name: Windows 11 VNC
+
+# Streams the desktop of a GitHub-hosted windows-11-arm runner into the browser.
+#
+# Proven viable by windows-probe.yml: that runner has a real interactive
+# desktop (not just session 0), x86/x64 emulation works, and RDP is enabled.
+#
+# Chain:
+#   TightVNC (captures the desktop) -> websockify (VNC -> WebSocket)
+#     -> noVNC (browser client) -> cloudflared (public HTTPS)
+#
+# noVNC needs a secure context for WebSocket, which the tunnel supplies.
+
+on:
+  workflow_dispatch:
+    inputs:
+      password:
+        description: VNC password (blank = auto-generate)
+        type: string
+        required: false
+      session_minutes:
+        description: Session length in minutes (max 355)
+        type: number
+        default: 120
+      allowed_emails:
+        description: Restrict access with a Cloudflare one-time PIN
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-vnc
+  cancel-in-progress: true
+
+jobs:
+  vnc:
+    name: Windows 11 desktop
+    runs-on: windows-11-arm
+    timeout-minutes: 360
+
+    env:
+      NOVNC_VERSION: v1.7.0
+      TIGHTVNC_URL: https://www.tightvnc.com/download/2.8.89/tightvnc-2.8.89-gpl-setup-64bit.msi
+      CLOUDFLARED_URL: https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe
+      VNC_PORT: "5900"
+      HTTP_PORT: "6080"
+
+    steps:
+      - name: Set up TightVNC, noVNC and the tunnel
+        id: setup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = "$env:RUNNER_TEMP\winvnc"
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $ProgressPreference = 'SilentlyContinue'
+
+          # ---------- password ----------
+          # VNC truncates to 8 characters, so generate something short and strong.
+          $pw = "${{ inputs.password }}"
+          if ([string]::IsNullOrWhiteSpace($pw)) {
+            $bytes = New-Object byte[] 6
+            [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+            $pw = ([System.BitConverter]::ToString($bytes) -replace '-','').ToLower()
+          }
+          if ($pw.Length -gt 8) {
+            Write-Host "::warning::VNC passwords are limited to 8 characters; truncating input"
+            $pw = $pw.Substring(0, 8)
+          }
+
+          # TightVNC stores the password in the registry as a DES-encrypted,
+          # reversed, zero-padded 8-byte block under a fixed key.
+          $key = [byte[]](0x23,0x87,0x4E,0x38,0x5A,0x39,0x73,0x4C)
+          $pwBytes = [System.Text.Encoding]::ASCII.GetBytes($pw)
+          $pad = New-Object byte[] 8
+          [Array]::Copy($pwBytes, $pad, $pwBytes.Length)
+          [Array]::Reverse($pad)
+          $des = [System.Security.Cryptography.DES]::Create()
+          $des.Mode = 'ECB'; $des.Padding = 'None'; $des.Key = $key
+          $enc = $des.CreateEncryptor().TransformFinalBlock($pad, 0, 8)
+          $pwHex = -join ($enc | ForEach-Object { $_.ToString('x2') })
+          $des.Dispose()
+
+          # ---------- install TightVNC ----------
+          $msi = "$work\tightvnc.msi"
+          Write-Host "downloading TightVNC"
+          Invoke-WebRequest -Uri $env:TIGHTVNC_URL -OutFile $msi -UseBasicParsing
+
+          # SET_PASSWD=1 lets us supply the password via the registry instead of
+          # an interactive prompt. SET_USRSC=0 installs the service system-wide.
+          Write-Host "installing TightVNC"
+          $p = Start-Process msiexec.exe -ArgumentList @(
+            '/i', "`"$msi`"", '/quiet', '/norestart',
+            'SET_USRSC=0', 'SET_PASSWD=1', 'SET_VIEWONLY=0', 'ACCEPT_EULA=1'
+          ) -Wait -PassThru
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            throw "msiexec failed with exit code $($p.ExitCode)"
+          }
+
+          $tvn = "${env:ProgramFiles}\TightVNC\tvnserver.exe"
+          if (-not (Test-Path $tvn)) { throw "tvnserver.exe not found after install" }
+
+          # ---------- configure ----------
+          $reg = 'HKLM:\SOFTWARE\TightVNC\Server'
+          New-Item -Path $reg -Force | Out-Null
+          Set-ItemProperty -Path $reg -Name 'Password'          -Value $pwHex
+          Set-ItemProperty -Path $reg -Name 'PasswordViewOnly'  -Value 0 -Type DWord
+          Set-ItemProperty -Path $reg -Name 'ControlPassword'   -Value $pwHex
+          Set-ItemProperty -Path $reg -Name 'UseControlAuthentication' -Value 0 -Type DWord
+          # Bind loopback only. The tunnel is the only route in, so there is no
+          # reason to expose 5900 on the runner's own interfaces.
+          Set-ItemProperty -Path $reg -Name 'LoopbackOnly'      -Value 1 -Type DWord
+          Set-ItemProperty -Path $reg -Name 'LoopbackPolicy'    -Value 1 -Type DWord
+          Set-ItemProperty -Path $reg -Name 'RfbVersion'        -Value 5 -Type DWord
+
+          # ---------- start the service ----------
+          Write-Host "starting TightVNC service"
+          $svc = Get-Service -Name 'tvnserver' -ErrorAction SilentlyContinue
+          if (-not $svc) { throw "tvnserver service was not created" }
+          if ($svc.StartType -ne 'Automatic') { Set-Service -Name 'tvnserver' -StartupType Automatic }
+          Start-Service -Name 'tvnserver'
+          (Get-Service -Name 'tvnserver').WaitForStatus('Running', [TimeSpan]::FromSeconds(45))
+
+          # Confirm it is actually listening before building anything on top.
+          $listening = $false
+          for ($i = 0; $i -lt 20; $i++) {
+            if (Get-NetTCPConnection -LocalPort $env:VNC_PORT -State Listen -ErrorAction SilentlyContinue) {
+              $listening = $true; break
+            }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $listening) { throw "TightVNC is not listening on $($env:VNC_PORT)" }
+          Write-Host "TightVNC listening on $($env:VNC_PORT)"
+
+          # ---------- noVNC ----------
+          $novnc = "$work\novnc"
+          $tarball = "$work\novnc.tar.gz"
+          Write-Host "downloading noVNC $($env:NOVNC_VERSION)"
+          Invoke-WebRequest -Uri "https://github.com/novnc/noVNC/archive/refs/tags/$($env:NOVNC_VERSION).tar.gz" -OutFile $tarball -UseBasicParsing
+          # GitHub source archives have a single top-level directory.
+          tar -xzf $tarball -C $work
+          $inner = Get-ChildItem -Directory $work | Where-Object { $_.Name -like 'noVNC-*' } | Select-Object -First 1
+          if (-not $inner) { throw "noVNC archive did not extract as expected" }
+          Move-Item $inner.FullName $novnc -Force
+          if (-not (Test-Path "$novnc\vnc.html")) { throw "vnc.html missing from noVNC" }
+
+          # ---------- websockify ----------
+          Write-Host "installing websockify"
+          python -m pip install --quiet --disable-pip-version-check websockify
+          # Verify it imports before we depend on it.
+          python -c "import websockify; print('websockify', websockify.__version__)"
+          if ($LASTEXITCODE -ne 0) { throw "websockify import failed" }
+
+          $log = "$work\websockify.log"
+          Write-Host "starting websockify on $($env:HTTP_PORT) -> $($env:VNC_PORT)"
+          $ws = Start-Process python -ArgumentList @(
+            '-m', 'websockify',
+            '--web', $novnc,
+            $env:HTTP_PORT, "127.0.0.1:$($env:VNC_PORT)"
+          ) -RedirectStandardOutput $log -RedirectStandardError "$work\websockify.err" -PassThru
+
+          $up = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            try {
+              $r = Invoke-WebRequest -Uri "http://127.0.0.1:$($env:HTTP_PORT)/vnc.html" -UseBasicParsing -TimeoutSec 4
+              if ($r.StatusCode -eq 200) { $up = $true; break }
+            } catch {}
+            if ($ws.HasExited) { break }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $up) {
+            Get-Content $log, "$work\websockify.err" -ErrorAction SilentlyContinue | Write-Host
+            throw "websockify did not serve vnc.html on port $($env:HTTP_PORT)"
+          }
+          Write-Host "noVNC served locally on $($env:HTTP_PORT)"
+
+          # ---------- cloudflared ----------
+          $cf = "$work\cloudflared.exe"
+          Write-Host "downloading cloudflared (amd64, runs emulated on ARM64)"
+          Invoke-WebRequest -Uri $env:CLOUDFLARED_URL -OutFile $cf -UseBasicParsing
+          $cfVersion = (& $cf --version 2>&1 | Out-String).Trim()
+          Write-Host "cloudflared: $cfVersion"
+
+          $cfLog = "$work\cloudflared.log"
+          $mailArgs = @()
+          if (-not [string]::IsNullOrWhiteSpace("${{ inputs.allowed_emails }}")) {
+            $mailArgs = @('--allowed-mail', '${{ inputs.allowed_emails }}')
+          }
+          # Start-Process cannot express a redirect to itself, so background it.
+          $cfProc = Start-Process $cf -ArgumentList (@('tunnel','--no-autoupdate','--url',"http://127.0.0.1:$($env:HTTP_PORT)") + $mailArgs) -RedirectStandardOutput $cfLog -RedirectStandardError "$work\cf.err" -PassThru
+
+          $url = $null
+          for ($i = 0; $i -lt 45; $i++) {
+            if (Test-Path $cfLog) {
+              $m = Select-String -Path $cfLog -Pattern 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' -AllMatches |
+                   ForEach-Object { $_.Matches } | ForEach-Object { $_.Value } | Select-Object -First 1
+              if ($m) { $url = "$m"; break }
+            }
+            if ($cfProc.HasExited) { break }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $url) {
+            Get-Content $cfLog, "$work\cf.err" -ErrorAction SilentlyContinue | Write-Host
+            throw "cloudflared did not report a tunnel URL"
+          }
+          Write-Host "public URL: $url"
+
+          # ---------- outputs ----------
+          "url=$url"      >> $env:GITHUB_OUTPUT
+          "password=$pw"  >> $env:GITHUB_OUTPUT
+          "novnc_dir=$novnc" >> $env:GITHUB_OUTPUT
+          "work_dir=$work"   >> $env:GITHUB_OUTPUT
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          $url = "${{ steps.setup.outputs.url }}"
+          $pw  = "${{ steps.setup.outputs.password }}"
+          {
+            "## Windows 11 desktop is live"
+            ""
+            "### [$url]($url)"
+            ""
+            "| | |"
+            "|---|---|"
+            "| Password | ``$pw`` |"
+            "| VNC password limit | 8 characters |"
+            "| Ends | ~${{ inputs.session_minutes }} min, or when you cancel |"
+            ""
+            "Anyone with the URL can reach the VNC login. Cancel the job to kill it."
+            if (-not [string]::IsNullOrWhiteSpace("${{ inputs.allowed_emails }}")) {
+              ""
+              "Access is additionally gated by a Cloudflare one-time PIN."
+            }
+          } | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          "URL: $url"
+
+      - name: Keep session alive
+        shell: pwsh
+        env:
+          MINUTES: ${{ inputs.session_minutes }}
+        run: |
+          $mins = [Math]::Min([int]$env:MINUTES, 355)
+          $end = (Get-Date).AddMinutes($mins)
+          while ((Get-Date) -lt $end) {
+            $svc = Get-Service -Name 'tvnserver' -ErrorAction SilentlyContinue
+            if (-not $svc -or $svc.Status -ne 'Running') {
+              Write-Host "::error::tvnserver is not running"
+              exit 1
+            }
+            $left = [int]($end - (Get-Date)).TotalMinutes
+            Write-Host "alive, $left min remaining"
+            Start-Sleep -Seconds 30
+          }
+
+      - name: Diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "--- tvnserver ---"
+          Get-Service -Name 'tvnserver' -ErrorAction SilentlyContinue |
+            Format-List Name, Status, StartType | Out-String | Write-Host
+          Write-Host "--- listening ports ---"
+          Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+            Where-Object { $_.LocalPort -in @(5900, 6080) } |
+            Select-Object LocalAddress, LocalPort, OwningProcess | Format-Table | Out-String | Write-Host
+          $w = "${{ steps.setup.outputs.work_dir }}"
+          foreach ($f in @("cloudflared.log", "cf.err", "websockify.log", "websockify.err")) {
+            if (Test-Path "$w\$f") {
+              Write-Host "--- $f ---"
+              Get-Content "$w\$f" -Tail 25 | Write-Host
+            }
+          }
+
+      - name: Tear down
+        if: always()
+        shell: pwsh
+        run: |
+          # Runner is disposable, but stop cleanly so the logs above are flushed.
+          foreach ($n in @('tvnserver')) {
+            Stop-Service -Name $n -Force -ErrorAction SilentlyContinue
+          }
+          Get-Process -Name 'cloudflared','python' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -like "*$env:RUNNER_TEMP*" } |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+          Write-Host "torn down"

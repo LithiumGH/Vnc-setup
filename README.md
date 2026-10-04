@@ -56,35 +56,60 @@ includes a passwordless-sudo terminal.
 
 ## Windows 11
 
-**Not available as a Linux flavor**, and not for an obvious reason. LinuxServer's
-webtop images are Linux containers; there is no Windows equivalent, because
-Windows containers are Nano Server or Server Core and contain **no GUI stack** at
-all — no DWM, no WPF, no shell.
+Windows is a **separate workflow**, because Windows containers cannot do this at
+all: they are Nano Server or Server Core and contain **no GUI stack** — no DWM,
+no WPF, no shell.
 
-GitHub does offer a `windows-11-arm` runner label, but:
-
-- It is **ARM64**. Most Windows software is x64 and needs emulation.
-- **cloudflared publishes no arm64 Windows build** (only 386/amd64), so the
-  tunnelling binary itself has to run emulated.
-- Streamed output needs a VNC/RDP server *plus* a capturable interactive desktop.
-  A headless runner may only offer session 0, which captures a **black screen**
-  regardless of which server you install.
-
-Rather than guess, there is a **feasibility probe** workflow that answers this in
-about two minutes. It downloads nothing, so a failure is a real signal rather
-than a bad URL:
+There is a **feasibility probe** that settles whether streaming is possible,
+without downloading anything, so a failure is a real signal rather than a bad
+URL:
 
 Actions → **Windows 11 feasibility probe** → **Run workflow**.
 
-It reports a plain verdict:
-
 | Verdict | Meaning |
 |---|---|
-| `VIABLE` | An interactive desktop exists and x86 emulation works — the streaming path is open |
-| `BLOCKED: no interactive desktop` | Any VNC/RDP server captures a black screen. Stop here |
+| `VIABLE` | An interactive desktop exists and emulation works |
+| `BLOCKED: no interactive desktop` | Any VNC server captures a black screen |
 | `BLOCKED: no x86 emulation` | No tunnelling binary can run either |
 
-Only build a Windows workflow after the probe says `VIABLE`.
+When the probe says `VIABLE`, run **Windows 11 VNC**. The chain is:
+
+```
+TightVNC (captures the desktop)
+  -> websockify (VNC protocol -> WebSocket)
+    -> noVNC (browser client)
+      -> cloudflared (public HTTPS)
+```
+
+The runner supplies the hard parts: a real interactive desktop in session 2,
+working x86/x64 emulation, and RDP already enabled. The workflow installs
+TightVNC silently, writes the password to the registry, and confirms port 5900 is
+actually listening **before** building anything on top of it.
+
+Download URLs were each verified to return 200 before being written in.
+TightVNC lives under a version directory (`/download/2.8.89/...`), which is why
+guessing paths earlier returned 404.
+
+### Windows caveats
+
+- VNC passwords truncate to **8 characters** — a protocol limit. Leave the input
+  blank for a random one. TightVNC wants the password as a reversed,
+  DES-encrypted block under a fixed key; that crypto is implemented in the
+  workflow and round-trip tested locally.
+- TightVNC binds to **loopback only**, so the runner's network cannot reach 5900.
+  The tunnel is the only way in.
+- The whole chain is **untested on a real `windows-11-arm` runner** — none was
+  available locally. The PowerShell parses and the crypto is verified, but the
+  TightVNC install and noVNC handshake have never run end to end. Expect to
+  iterate.
+- `cloudflared` has no arm64 Windows build, so amd64 runs emulated. The probe
+  confirmed x86 emulation; amd64 is the same mechanism but isn't separately
+  confirmed.
+- This is **VNC, not RDP**: worse quality and latency than the Linux path's
+  H.264/WebCodecs stream, and there is **no package persistence** here.
+
+If it fails, `Diagnostics` prints the TightVNC service state, listening ports,
+and the tails of the websockify and cloudflared logs.
 
 ## Using it locally
 
