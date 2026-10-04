@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Browser-based Ubuntu desktop for GitHub Actions (or any local Docker host).
+# Browser-based Linux desktop for GitHub Actions (or any local Docker host).
 #
-# Streams an Ubuntu XFCE desktop to the browser using Selkies, which encodes
+# Streams a Linux desktop to the browser using Selkies, which encodes
 # H.264 with WebCodecs. That is dramatically lower latency than classic noVNC
 # framebuffer streaming, which sends raw rectangles as PNG/JPEG.
 #
@@ -16,7 +16,7 @@ set -Eeuo pipefail
 
 # ---------------------------------------------------------------- config ----
 IMAGE_REPO="${IMAGE_REPO:-lscr.io/linuxserver/webtop}"
-FLAVOR="${FLAVOR:-ubuntu-xfce}"
+FLAVOR="${FLAVOR:-fedora-xfce}"
 CONTAINER="${CONTAINER:-ubuntu-desktop}"
 
 VNC_USER="${VNC_USER:-dev}"
@@ -65,6 +65,10 @@ EXTRA_DOCKER_ARGS="${EXTRA_DOCKER_ARGS:-}"
 # Ad-hoc Selkies tuning, e.g. 'SELKIES_VIDEO_CRF=18 SELKIES_MANUAL_WIDTH=1280'.
 # Restricted to SELKIES_* keys so this can never smuggle in a docker flag.
 EXTRA_SELKIES="${EXTRA_SELKIES:-}"
+
+# Set VULKAN_ICD="" to skip forcing the software Vulkan ICD; it is resolved in
+# cmd_up, not here, because vulkan_icd() is defined further down this file.
+VULKAN_ICD="${VULKAN_ICD-}"
 
 STATE_DIR="${DESKTOP_STATE_DIR:-${TMPDIR:-/tmp}/ubuntu-desktop-vnc}"
 TUNNEL_LOG="$STATE_DIR/cloudflared.log"
@@ -190,7 +194,7 @@ cmd_up() {
     -e "TZ=$TZ_NAME"
     -e "CUSTOM_USER=$VNC_USER"
     -e "PASSWORD=$PASSWORD"
-    -e "TITLE=Ubuntu Desktop (${FLAVOR#ubuntu-})"
+    -e "TITLE=$(flavor_label)"
     # --- latency ---
     -e "SELKIES_AUDIO_FRAME_DURATION_MS=$AUDIO_FRAME_MS"
     -e "SELKIES_BACKPRESSURE_QUEUE_SIZE=$BACKPRESSURE"
@@ -200,18 +204,18 @@ cmd_up() {
   )
 
   if [[ "$SOFTWARE_RENDER" == "true" ]]; then
+    local icd="${VULKAN_ICD:-$(vulkan_icd)}"
     log "software rendering: llvmpipe ${SOFTWARE_WIDTH}x${SOFTWARE_HEIGHT} @ ${SOFTWARE_FRAMERATE}fps cap"
     args+=(
       # Stop Selkies probing for an encode GPU that is not there.
       -e AUTO_GPU=false
       # Xvfb without DRI3; display capture falls back to shared memory.
       -e DISABLE_DRI3=true
-      # Force CPU rasterisation for OpenGL, and software Vulkan via lavapipe.
+      # Force CPU rasterisation for OpenGL.
       -e LIBGL_ALWAYS_SOFTWARE=1
       -e GALLIUM_DRIVER=llvmpipe
       -e MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
-      -e VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json
-      # Cap rather than merely default the framerate: a "24,8-24" range lets
+      # Capped rather than merely default the framerate: a "24,8-24" range lets
       # the user lower it but stops them pinning 240fps and melting the CPU.
       -e "SELKIES_FRAMERATE=${SOFTWARE_FRAMERATE},8-${SOFTWARE_FRAMERATE}"
       # Higher CRF means fewer bits and less encoder work.
@@ -223,6 +227,13 @@ cmd_up() {
       -e "SELKIES_MANUAL_WIDTH=$SOFTWARE_WIDTH"
       -e "SELKIES_MANUAL_HEIGHT=$SOFTWARE_HEIGHT"
     )
+    # An empty VK_ICD_FILENAMES is worse than omitting it, so only pass it when
+    # we resolved a real path.
+    if [[ -n "$icd" ]]; then
+      args+=(-e "VK_ICD_FILENAMES=$icd")
+    else
+      log "VULKAN_ICD empty, leaving the Vulkan loader to choose"
+    fi
   else
     args+=(-e "SELKIES_FRAMERATE=$FRAMERATE")
   fi
@@ -418,6 +429,32 @@ cmd_status() {
 cmd_logs()  { docker logs --tail "${1:-200}" "$CONTAINER"; }
 cmd_shell() { docker exec -it "$CONTAINER" bash; }
 
+# Human label for the browser tab, from a flavor name like "fedora-xfce".
+# "latest" is XFCE on Alpine, so name that one explicitly.
+flavor_label() {
+  local base de
+  case "$FLAVOR" in
+    latest) echo "Alpine XFCE"; return ;;
+    *-*)    base="${FLAVOR%-*}"; de="${FLAVOR##*-}" ;;
+    *)      echo "$FLAVOR"; return ;;
+  esac
+  printf '%s %s\n' \
+    "$(printf '%s' "$base" | tr '[:lower:]' '[:upper:]')" \
+    "$(printf '%s' "$de"   | tr '[:lower:]' '[:upper:]')"
+}
+
+# Mesa's software Vulkan (lavapipe) ICD file is named differently per distro:
+# verified Debian/Ubuntu ship lvp_icd.json, Fedora ships lvp_icd.x86_64.json.
+# Pointing VK_ICD_FILENAMES at a file that does not exist breaks Vulkan rather
+# than falling back, so this has to be right per distro family.
+# Set VULKAN_ICD="" to skip forcing it and let the loader choose.
+vulkan_icd() {
+  case "$FLAVOR" in
+    fedora-*|rocky-*|alma-*|centos-*) echo "/usr/share/vulkan/icd.d/lvp_icd.x86_64.json" ;;
+    *)                                echo "/usr/share/vulkan/icd.d/lvp_icd.json" ;;
+  esac
+}
+
 # Confirms which rasteriser is actually live inside the running desktop, rather
 # than trusting the env vars we passed in.
 cmd_glinfo() {
@@ -430,11 +467,22 @@ cmd_glinfo() {
       glxinfo -B 2>/dev/null | grep -E "Device|Accelerated|OpenGL core version"
     else
       echo "glxinfo absent (mesa-utils not installed)"
-      echo "software driver present: $(ls /usr/lib/x86_64-linux-gnu/dri/swrast_dri.so 2>/dev/null || echo NO)"
+      # Driver dir differs by distro: Debian/Ubuntu is multiarch, Fedora is lib64.
+      echo "software driver: $(ls /usr/lib*/dri/swrast_dri.so /usr/lib/*/dri/swrast_dri.so 2>/dev/null | head -1 || echo NOT FOUND)"
     fi
     echo
     echo "=== rendering env ==="
     env | grep -E "LIBGL_ALWAYS_SOFTWARE|GALLIUM_DRIVER|MESA_LOADER_DRIVER|VK_ICD_FILENAMES" | sort
+    echo
+    echo "=== software Vulkan ICD ==="
+    icd="${VK_ICD_FILENAMES:-}"
+    if [ -z "$icd" ]; then
+      echo "VK_ICD_FILENAMES not set, loader will choose"
+    elif [ -f "$icd" ]; then
+      echo "OK      $icd"
+    else
+      echo "MISSING $icd  <-- Vulkan will fail; the filename differs per distro"
+    fi
     echo
     echo "=== vcpu count ==="
     nproc

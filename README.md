@@ -1,11 +1,12 @@
-# Ubuntu Desktop in the browser, from GitHub Actions
+# A Linux desktop in the browser, from GitHub Actions
 
-Runs a real Ubuntu XFCE desktop on a GitHub-hosted runner and streams it to your
-browser over HTTPS. No VPS, no port forwarding, no Cloudflare account.
+Runs a real Linux desktop (XFCE by default, Ubuntu or Fedora or Debian or Arch)
+on a GitHub-hosted runner and streams it to your browser over HTTPS. No VPS, no
+port forwarding, no Cloudflare account.
 
 ```
 your browser ──HTTPS──> Cloudflare edge ──tunnel──> ubuntu-latest runner
-                                                        └─ webtop:ubuntu-xfce
+                                                        └─ webtop:<flavor>
                                                            (XFCE + Selkies)
 ```
 
@@ -28,11 +29,11 @@ responsiveness comes from.
 
 ```bash
 cd vnc-ubuntu
-git init && git add -A && git commit -m "browser ubuntu desktop"
+git init && git add -A && git commit -m "browser linux desktop"
 gh repo create --private --source=. --push   # or push to any GitHub repo
 ```
 
-Then **Actions → Ubuntu Desktop (browser VNC) → Run workflow**. The job summary
+Then **Actions → Linux Desktop (browser VNC) → Run workflow**. The job summary
 at the end of the run has the link and the password.
 
 The repo has to exist on GitHub for Actions to run, but it can be almost empty.
@@ -43,7 +44,7 @@ includes a passwordless-sudo terminal.
 
 | Input | Default | Notes |
 |---|---|---|
-| `flavor` | `ubuntu-xfce` | Also `ubuntu-mate`, `ubuntu-kde`, `ubuntu-lxqt`, `ubuntu-i3` |
+| `flavor` | `ubuntu-xfce` | `fedora-xfce`, `debian-xfce`, `arch-xfce`, plus `-mate`/`-kde`/`-i3`/`-lxqt` variants |
 | `session_minutes` | `240` | Hard-capped at 355, GitHub's job limit is 360 |
 | `password` | *(blank)* | Blank uses the `VNC_PASSWORD` secret, else generates one |
 | `allowed_emails` | *(blank)* | Cloudflare one-time-PIN gate. Needs a real address and an interactive browser |
@@ -108,12 +109,19 @@ Version: Mesa 26.0.8   GL 4.5 core profile   Accelerated: no
 456 FPS (glxgears, 8 vCPU, 1280x720)
 ```
 
+and on Fedora 44, software Vulkan comes up as:
+
+```
+deviceName = llvmpipe (LLVM 22.1.8, 256 bits)
+driverInfo = Mesa 26.2.3
+```
+
 When `software_render` is on, the script sets:
 
 | Setting | Value | Why |
 |---|---|---|
 | `LIBGL_ALWAYS_SOFTWARE`, `GALLIUM_DRIVER`, `MESA_LOADER_DRIVER_OVERRIDE` | `llvmpipe` | Force CPU rasterisation |
-| `VK_ICD_FILENAMES` | `lvp_icd.json` | Software **Vulkan** (lavapipe) for titles that want Vulkan |
+| `VK_ICD_FILENAMES` | distro-dependent | Software **Vulkan** (lavapipe). See the note below |
 | `AUTO_GPU` | `false` | Stop Selkies probing for an encode GPU that isn't there |
 | `DISABLE_DRI3` | `true` | Xvfb without GPU; capture falls back to shared memory |
 | `SELKIES_MANUAL_WIDTH/HEIGHT` | `1280x720` | llvmpipe cost scales with pixel count |
@@ -121,11 +129,31 @@ When `software_render` is on, the script sets:
 | `SELKIES_VIDEO_CRF` | `30` | Fewer bits, less encoder work |
 | `SELKIES_USE_PAINT_OVER_QUALITY` | `false` | Paint-over at q90 is expensive for little gain |
 
-Verify it's live at any time:
+### Distro differences that actually bite
+
+Not theoretical — both of these bit us and are handled in the script:
+
+- **The lavapipe ICD filename differs.** Debian/Ubuntu ship
+  `/usr/share/vulkan/icd.d/lvp_icd.json`; Fedora ships `lvp_icd.x86_64.json`.
+  Pointing `VK_ICD_FILENAMES` at a file that doesn't exist breaks Vulkan outright
+  rather than falling back, so the script picks per distro family. Override with
+  `VULKAN_ICD=/path/to/icd.json`, or set `VULKAN_ICD=""` to let the loader choose.
+- **The Mesa driver directory differs.** Debian/Ubuntu use the multiarch
+  `/usr/lib/x86_64-linux-gnu/dri/`, Fedora uses `/usr/lib64/dri/`. The env vars
+  above are driver-agnostic so rendering works either way, but anything you
+  script against those paths must not hardcode them.
+
+`desktop.sh glinfo` checks the ICD path actually exists, so a wrong guess shows
+up as `MISSING` rather than as mysteriously broken Vulkan later.
+
+Verify it any time:
 
 ```bash
 ./scripts/desktop.sh glinfo
 ```
+
+> Note: `glxinfo` comes from `mesa-utils`, which **Fedora 44 no longer ships**.
+> On Fedora use `vulkaninfo` (from `vulkan-tools`) to confirm the renderer.
 
 **What this is good for.** Desktop apps, browsers, 2D games, older titles, indie
 games with modest 3D. **What it isn't:** anything modern and 3D-heavy. Note also
@@ -182,7 +210,7 @@ the kind of data:
 |---|---|---|
 | **Code and config files** | **Commit to the repo** | Already mounted at `/config/workspace`. Versioned, reviewable, actually durable |
 | **XFCE settings, dotfiles** | `cache_config` | 4.5 MB, fits easily |
-| **Installed software** | **Custom image** (below) | `apt install` writes to `/usr`, which is *not* a volume and is lost |
+| **Installed software** | **Custom image** (below) | The package manager writes to `/usr`, which is *not* a volume and is lost |
 | **Large generated data** | `actions/upload-artifact` | Explicit round-trip, 90-day retention |
 
 **Correction to something I said earlier:** I described `cache_config` as making
@@ -195,10 +223,9 @@ Bake them into an image instead of installing them each run:
 
 ```dockerfile
 # Dockerfile.desktop
-FROM lscr.io/linuxserver/webtop:ubuntu-xfce
-RUN apt-get update \
- && apt-get install -y --no-install-recommends neofetch gimp \
- && rm -rf /var/lib/apt/lists/*
+FROM lscr.io/linuxserver/webtop:fedora-xfce
+RUN dnf install -y --nodocs neofetch gimp \
+ && dnf clean all
 ```
 
 Build and push it, then point the script at it:

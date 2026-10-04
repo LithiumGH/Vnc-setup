@@ -1,8 +1,8 @@
-name: Ubuntu Desktop (browser VNC)
+name: Linux Desktop (browser VNC)
 
-# Spins up a real Ubuntu XFCE desktop on a GitHub-hosted runner and streams it
-# to your browser over HTTPS. The runner has no inbound ports, so the desktop is
-# published through a Cloudflare Quick Tunnel, which needs no account.
+# Spins up a real Linux desktop (XFCE by default) on a GitHub-hosted runner and
+# streams it to your browser over HTTPS. The runner has no inbound ports, so the
+# desktop is published through a Cloudflare Quick Tunnel, which needs no account.
 #
 # The session is ephemeral: it dies when the job ends or you cancel it, and the
 # public URL stops working at that moment.
@@ -11,15 +11,27 @@ on:
   workflow_dispatch:
     inputs:
       flavor:
-        description: Desktop flavor
+        description: Distro and desktop flavor
         type: choice
-        default: ubuntu-xfce
+        default: fedora-xfce
         options:
           - ubuntu-xfce
           - ubuntu-mate
           - ubuntu-kde
           - ubuntu-lxqt
           - ubuntu-i3
+          - fedora-xfce
+          - fedora-mate
+          - fedora-kde
+          - fedora-i3
+          - debian-xfce
+          - debian-mate
+          - debian-kde
+          - debian-i3
+          - arch-xfce
+          - arch-mate
+          - arch-kde
+          - arch-i3
       session_minutes:
         description: Session length in minutes (max 355)
         type: number
@@ -59,7 +71,7 @@ concurrency:
 
 jobs:
   desktop:
-    name: Ubuntu desktop
+    name: Linux desktop
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
@@ -124,6 +136,7 @@ jobs:
         id: publish
         env:
           SESSION_MINUTES: ${{ inputs.session_minutes }}
+          SOFTWARE_RENDER: ${{ inputs.software_render }}
         run: |
           set -euo pipefail
           source "$DESKTOP_STATE_DIR/state.env"
@@ -134,7 +147,7 @@ jobs:
           } >>"$GITHUB_OUTPUT"
 
           {
-            echo "## Ubuntu desktop is live"
+            echo "## Desktop is live"
             echo
             echo "### [$PUBLIC_URL]($PUBLIC_URL)"
             echo
@@ -143,6 +156,7 @@ jobs:
             echo "| Username | \`$VNC_USER\` |"
             echo "| Password | \`$PASSWORD\` |"
             echo "| Image | \`$IMAGE\` |"
+            echo "| Render | $( [ "$SOFTWARE_RENDER" = "true" ] && echo "software (llvmpipe)" || echo "GPU passthrough" ) |"
             echo "| Ends | ~$SESSION_MINUTES min from now, or when you cancel this job |"
             echo
             echo "Anyone with the URL can reach the login screen. Cancel the job to kill it."
