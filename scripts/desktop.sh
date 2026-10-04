@@ -91,14 +91,15 @@ if [[ "$CSS_SCALE" == "auto" ]]; then
   CSS_SCALE=$preset_css
 fi
 
-# llvmpipe rasterises across threads and, left alone, claims every core. The
-# H.264 encoder and the container's audio/websocket handling need CPU too, so
-# reserve one core for them rather than letting rasterisation starve the
-# encoder. On a 2 vCPU runner this is 1 thread; on an 8-core box, 7.
-if [[ -z "${LP_NUM_THREADS+x}" ]]; then
-  _cores=$(nproc 2>/dev/null || echo 1)
-  LP_NUM_THREADS=$(( _cores > 1 ? _cores - 1 : 1 ))
-fi
+# llvmpipe thread count. Left unset by default so Mesa picks for itself.
+#
+# NOTE: this was previously defaulted to "nproc - 1" on the theory that llvmpipe
+# would starve the encoder. Measured, that was wrong: a fixed render at 1, 2, 4
+# and 8 threads took the same wall-clock time, so setting it made no difference
+# on the host it was tested on. It stays overridable because it is the
+# documented Mesa variable and does matter on some builds -- but it is not
+# claimed to be a win here.
+LP_NUM_THREADS="${LP_NUM_THREADS:-}"
 
 HTTP_PORT="${HTTP_PORT:-3000}"
 HTTPS_PORT="${HTTPS_PORT:-3001}"

@@ -201,7 +201,7 @@ When `software_render` is on, the script sets:
 | `SELKIES_VIDEO_CRF` | from the preset | Fewer bits, less encoder work |
 | `SELKIES_USE_PAINT_OVER_QUALITY` | `false` | Paint-over at q90 is expensive for little gain |
 | `SELKIES_USE_CSS_SCALING` | `true` | Browser upscales the framebuffer; view still fills the window |
-| `LP_NUM_THREADS` | `nproc - 1` | llvmpipe otherwise claims every core and starves the encoder |
+| `LP_NUM_THREADS` | *(unset)* | Mesa decides. Setting it made no measurable difference when tested — see the note below |
 
 ### Render presets
 
@@ -221,21 +221,53 @@ Two things make the low presets more than a resolution change:
 - **CSS scaling.** The framebuffer is rendered small and the *browser* stretches
   it to fill the window. You keep a full-screen view while only the low-res
   pixels are ever rasterised and encoded, so it cuts CPU and bandwidth together.
-- **Thread reservation.** llvmpipe grabs every core by default. One is held
-  back for the H.264 encoder, which otherwise starves and turns a smooth desktop
-  into stutter.
 
-Set `resolution` to an exact size to bypass the preset, or `LP_NUM_THREADS` to
-override the thread count. Both work as env vars locally:
+Set `resolution` to an exact size to bypass the preset. Both work as env vars
+locally:
 
 ```bash
 RENDER_PRESET=potato ./scripts/desktop.sh up
-LP_NUM_THREADS=4 RENDER_PRESET=balanced ./scripts/desktop.sh up
+SOFTWARE_WIDTH=1024 SOFTWARE_HEIGHT=600 ./scripts/desktop.sh up
 ```
 
 **Presets are ignored when a GPU is passed through.** They exist to make CPU
 rasterisation affordable; clamping framerate and bitrate would only hobble real
 hardware, so `gpu: nvidia|amd` renders at 1080p60 with no CSS scaling.
+
+#### Measured limits (x264 encode, 2 threads, in the container)
+
+The encoder, not the rasteriser, is what caps the frame rate. Frames per second
+the encoder can produce on **2 threads**:
+
+| Resolution | `veryfast` | `ultrafast` |
+|---|---|---|
+| 640×360 | 250 | 545 |
+| 854×480 | 192 | 342 |
+| 1280×720 | 86 | 183 |
+| 1920×1080 | **37** | 75 |
+
+**1080p cannot reach 60fps** on two threads — the encoder alone tops out at 37.
+720p only just clears it, leaving almost nothing for rasterisation. 480p has
+roughly 3× the headroom you need.
+
+Rasterisation was measured separately with `glmark2` at 856×480: score 133–161
+depending on thread count, best individual draw ~243 fps. So at 480p **neither
+half of the pipeline is the bottleneck** — 60fps is reachable on 2 vCPUs.
+
+#### What did *not* measure as a factor
+
+`LP_NUM_THREADS` made no measurable difference. The same render took the same
+wall-clock time at 1, 2, 4 and 8 threads (334s / 333s / 333s / 333s), and
+`glmark2` scores moved only ~20% from 2 to 8 threads. Two caveats before
+dismissing core count as a lever:
+
+- This was measured on Windows under Docker Desktop with ~7 GB RAM, where
+  background load and Resource Saver make CPU scaling unreliable.
+- It was a *single* thread-count comparison on one build of Mesa.
+
+So core count is **unproven, not disproven**. If you want a real answer, measure
+it on the machine that will actually run the desktop — `nproc` and a `glmark2`
+run there will tell you in a few minutes.
 
 ### Distro differences that actually bite
 
