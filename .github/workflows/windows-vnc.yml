@@ -48,8 +48,9 @@ jobs:
       HTTP_PORT: "6080"
 
     steps:
-      - name: Set up TightVNC, noVNC and the tunnel
+      - name: Serve the desktop
         id: setup
+        timeout-minutes: 360
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -235,16 +236,33 @@ jobs:
           # ---------- outputs ----------
           "url=$url"      >> $env:GITHUB_OUTPUT
           "password=$pw"  >> $env:GITHUB_OUTPUT
-          "novnc_dir=$novnc" >> $env:GITHUB_OUTPUT
           "work_dir=$work"   >> $env:GITHUB_OUTPUT
 
-      - name: Publish
-        shell: pwsh
-        run: |
-          $url = "${{ steps.setup.outputs.url }}"
-          $pw  = "${{ steps.setup.outputs.password }}"
+          # ---------- verify the tunnel actually serves traffic ----------
+          # Creating the tunnel is not proof it works. A connector that died or
+          # was never reachable yields Cloudflare error 1033 in the browser, so
+          # confirm end to end from inside the runner before advertising it.
+          Write-Host "verifying the public URL end to end"
+          $verdict = "unreachable"
+          for ($i = 0; $i -lt 20; $i++) {
+            try {
+              $r = Invoke-WebRequest -Uri "$url/vnc.html" -UseBasicParsing -TimeoutSec 10
+              if ($r.StatusCode -eq 200) { $verdict = "ok"; break }
+            } catch {
+              $resp = $_.Exception.Response
+              if ($resp -and [int]$resp.StatusCode -eq 200) { $verdict = "ok"; break }
+              if ($_.Exception.Message -match '1033') { $verdict = 'error 1033 (no connector)' }
+            }
+            Start-Sleep -Seconds 5
+          }
+          Write-Host "public URL check: $verdict"
+          if ($verdict -ne "ok") {
+            Write-Host "::warning::The tunnel is up but $verdict. The URL may still settle; see Diagnostics."
+          }
+
+          # ---------- publish ----------
           {
-            "## Windows 11 desktop is live"
+            "## Windows 11 desktop"
             ""
             "### [$url]($url)"
             ""
@@ -252,7 +270,11 @@ jobs:
             "|---|---|"
             "| Password | ``$pw`` |"
             "| VNC password limit | 8 characters |"
+            "| Public URL check | $verdict |"
             "| Ends | ~${{ inputs.session_minutes }} min, or when you cancel |"
+            ""
+            "If the page shows **Cloudflare Tunnel error 1033**, the tunnel is not"
+            "connected yet; wait a few seconds and reload."
             ""
             "Anyone with the URL can reach the VNC login. Cancel the job to kill it."
             if (-not [string]::IsNullOrWhiteSpace("${{ inputs.allowed_emails }}")) {
@@ -260,25 +282,36 @@ jobs:
               "Access is additionally gated by a Cloudflare one-time PIN."
             }
           } | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
-          "URL: $url"
 
-      - name: Keep session alive
-        shell: pwsh
-        env:
-          MINUTES: ${{ inputs.session_minutes }}
-        run: |
-          $mins = [Math]::Min([int]$env:MINUTES, 355)
+          # ---------- hold the session, in THIS step ----------
+          # This must not be a separate step: on Windows runners a process
+          # started with Start-Process is torn down when its step ends, which
+          # killed cloudflared and produced error 1033. Keeping the loop here
+          # means the processes stay alive for as long as the tunnel is needed.
+          $mins = [Math]::Min([int]"${{ inputs.session_minutes }}", 355)
           $end = (Get-Date).AddMinutes($mins)
+          Write-Host "holding for $mins min"
           while ((Get-Date) -lt $end) {
             $svc = Get-Service -Name 'tvnserver' -ErrorAction SilentlyContinue
             if (-not $svc -or $svc.Status -ne 'Running') {
-              Write-Host "::error::tvnserver is not running"
+              Write-Host "::error::tvnserver stopped; desktop is gone"
+              exit 1
+            }
+            # The tunnel is the thing that actually dies, so watch the process
+            # and not just the VNC service.
+            if ($cfProc.HasExited) {
+              Write-Host "::error::cloudflared exited with code $($cfProc.ExitCode); the public URL is dead"
+              exit 1
+            }
+            if ($ws.HasExited) {
+              Write-Host "::error::websockify exited with code $($ws.ExitCode)"
               exit 1
             }
             $left = [int]($end - (Get-Date)).TotalMinutes
             Write-Host "alive, $left min remaining"
-            Start-Sleep -Seconds 30
+            Start-Sleep -Seconds 20
           }
+          Write-Host "session window elapsed"
 
       - name: Diagnostics
         if: always()
