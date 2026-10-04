@@ -1,0 +1,184 @@
+name: Windows 11 feasibility probe
+
+# Answers one question honestly: can a browser-streamable desktop exist on a
+# GitHub-hosted Windows 11 ARM runner at all?
+#
+# Deliberately avoids every dependency that proved unobtainable or unstable
+# while researching (TightVNC, MeshCentral, noVNC release assets, cloudflared
+# arm64). Nothing here downloads anything, so a failure is a real signal rather
+# than a bad URL.
+#
+# Costs roughly 2 minutes. Read the verdict in the job summary.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-probe
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: Probe windows-11-arm
+    runs-on: windows-11-arm
+    timeout-minutes: 15
+
+    steps:
+      - name: Probe
+        id: probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $findings = [ordered]@{}
+          $blockers = @()
+
+          function Add-Finding($k, $v, $ok) {
+            $findings[$k] = [ordered]@{ value = "$v"; ok = $ok }
+            if (-not $ok) { $script:blockers += $k }
+          }
+
+          # --- 1. What OS is this really? ---
+          $os = Get-CimInstance Win32_OperatingSystem
+          Add-Finding "os" ("{0} {1} build {2}" -f $os.Caption, $os.Version, $os.BuildNumber) $true
+
+          # --- 2. Is the CPU actually ARM64, and does x64 emulation work? ---
+          #     cloudflared ships windows-386/amd64 only, so this decides whether
+          #     any tunnelling is even possible on this runner.
+          $arch = $env:PROCESSOR_ARCHITECTURE
+          $native = (Get-CimInstance Win32_Processor).Architecture
+          Add-Finding "processor_arch" "$arch (native=$native)" $true
+
+          $emuOk = $false
+          $emuNote = "not attempted"
+          try {
+            # 32-bit x86 binary: if this runs, the ARM64 host emulates x86.
+            # cmd.exe under Sysnative/WOW64 is present on ARM64 Windows.
+            $x86 = "$env:SystemRoot\SysWOW64\cmd.exe"
+            if (Test-Path $x86) {
+              $out = & $x86 /c "echo EMULATION_OK" 2>&1
+              $emuOk = ("$out" -match "EMULATION_OK")
+              $emuNote = "$x86 -> $out"
+            } else {
+              $emuNote = "SysWOW64\cmd.exe absent (no WOW64 emulation layer)"
+            }
+          } catch { $emuNote = "error: $_" }
+          Add-Finding "x86_emulation" $emuNote $emuOk
+
+          # --- 3. THE decisive question: is there an interactive desktop? ---
+          #     A VNC/RDP server can only capture a real desktop. If every
+          #     session is non-interactive or the console is locked, streaming
+          #     produces a black screen no matter which server we install.
+          #
+          #     qwinsta is not always on PATH (absent entirely on some SKUs), so
+          #     try the full path, then fall back to querying logon sessions.
+          #     Reporting success on empty data would hide the very failure we
+          #     are looking for.
+          $sessions = ""
+          $sessionSrc = "none"
+          $qwinsta = "$env:SystemRoot\System32\qwinsta.exe"
+          if (Test-Path $qwinsta) {
+            $sessions = (& $qwinsta 2>&1 | Out-String).Trim()
+            if ($sessions) { $sessionSrc = "qwinsta" }
+          }
+          if (-not $sessions) {
+            try {
+              $ls = Get-CimInstance Win32_LogonSession -ErrorAction Stop |
+                    Select-Object -ExpandProperty LogonId | Sort-Object -Unique
+              if ($ls) {
+                $sessions = "LogonId(s): $($ls -join ', ')"
+                $sessionSrc = "Win32_LogonSession"
+              }
+            } catch {}
+          }
+          if (-not $sessions) { $sessions = "(could not enumerate sessions)" }
+
+          $interactive = @()
+
+          # Are we in session 0? Services run there and have no real desktop.
+          $sessId = try { (Get-Process -Id $PID).SessionId } catch { $null }
+          Add-Finding "current_session_id" ("{0}{1}" -f $sessId, $(if ($sessId -eq 0) { "  (service session, no interactive desktop of its own)" } else { "" })) $true
+
+          # A running shell means a real interactive desktop exists somewhere.
+          try {
+            $explorer = @(Get-Process explorer -ErrorAction SilentlyContinue)
+            if ($explorer.Count -gt 0) { $interactive += "explorer.exe running (pid $($explorer[0].Id))" }
+          } catch {}
+
+          # A session in Active/Disc state owns a visible desktop.
+          foreach ($line in ($sessions -split "`r?`n")) {
+            if ($line -match '^\s*(\S+)\s+(\S+)\s+(\d+)') {
+              if ($matches[2] -in @('Active', 'Disc', 'Conn')) { $interactive += "session with a desktop: $($matches[1]) ($($matches[2]))" }
+            }
+          }
+
+          $desktopOk = ($interactive.Count -gt 0)
+          Add-Finding "sessions_source" $sessionSrc ($sessionSrc -ne "none")
+          Add-Finding "interactive_desktop" ($(if ($interactive) { $interactive -join '; ' } else { 'NONE FOUND' })) $desktopOk
+
+          # --- 4. Could RDP be turned on as a capture source? ---
+          $rdpSvc = Get-Service TermService -ErrorAction SilentlyContinue
+          $rdpState = if ($rdpSvc) { $rdpSvc.Status } else { 'not present' }
+          Add-Finding "rdp_service" "TermService = $rdpState" ($null -ne $rdpSvc)
+
+          $rdpEnabled = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -ErrorAction SilentlyContinue).fDenyTSConnections
+          Add-Finding "rdp_enabled" ("fDenyTSConnections={0} ({1})" -f $rdpEnabled, $(if ($rdpEnabled -eq 0) { 'RDP allowed' } else { 'RDP blocked' })) ($rdpEnabled -eq 0)
+
+          # --- 5. Java, for the Guacamole route if we need it ---
+          $java = $null
+          try { $java = (& java -version 2>&1 | Out-String).Trim() -split "`r?`n" | Select-Object -First 1 } catch {}
+          Add-Finding "java" ($(if ($java) { $java } else { 'not found' })) ([bool]$java)
+
+          # --- 6. Disk and CPU, to sanity check any future VM approach ---
+          $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+          $freeGB = [math]::Round($disk.FreeSpace / 1GB, 1)
+          Add-Finding "disk_free_gb" $freeGB $true
+          $cpu = (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors
+          Add-Finding "logical_cpus" $cpu $true
+
+          # --- verdict ---
+          # The two things that must both hold for any browser streaming to work.
+          $verdict = if ($desktopOk -and $emuOk) { "VIABLE" }
+                     elseif (-not $desktopOk) { "BLOCKED: no interactive desktop to capture" }
+                     else { "BLOCKED: no x86/x64 emulation for a VNC/tunnel binary" }
+
+          Add-Finding "verdict" $verdict $true
+
+          # --- summary ---
+          $lines = @("## Windows 11 runner probe", "", "**Verdict: $verdict**", "", "| Check | Result | Pass |", "|---|---|---|")
+          foreach ($k in $findings.Keys) {
+            $f = $findings[$k]
+            $lines += "| ``$k`` | $($f.value -replace '\|','\|') | $(if ($f.ok) { 'yes' } else { 'NO' }) |"
+          }
+          $lines += ""
+          $lines += ""
+          $lines += "### Reading this"
+          $lines += ""
+          $lines += "- **interactive_desktop** is the make-or-break. ``NO`` means any VNC or"
+          $lines += "  RDP server we install will capture a black screen."
+          $lines += "- **x86_emulation** decides whether the amd64 cloudflared binary can run,"
+          $lines += "  since there is no arm64 Windows build of it."
+          $lines += "- **os / logical_cpus / disk_free_gb** are context for sizing anything on top."
+          $lines += ""
+          $lines += "Raw session table:"
+          $lines += '```'
+          $lines += ($sessions -split "`r?`n" | ForEach-Object { $_.TrimEnd() })
+          $lines += '```'
+          $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+          # Also dump plainly so it is greppable in the log.
+          foreach ($k in $findings.Keys) {
+            "PROBE $k = $($findings[$k].value) | ok=$($findings[$k].ok)"
+          }
+          "PROBE VERDICT = $verdict"
+
+      - name: Verdict
+        if: always()
+        shell: pwsh
+        run: |
+          $blocked = $false
+          "See the job summary for the full table."
+          # Do not fail the run; the verdict is information, not an error.
+          exit 0

@@ -54,6 +54,38 @@ includes a passwordless-sudo terminal.
 | `resolution` | `1280x720` | Pinned in software mode; must look like `WIDTHxHEIGHT` |
 | `save_packages` | `true` | Snapshot installed packages to `desktop-packages.txt` at job end |
 
+## Windows 11
+
+**Not available as a Linux flavor**, and not for an obvious reason. LinuxServer's
+webtop images are Linux containers; there is no Windows equivalent, because
+Windows containers are Nano Server or Server Core and contain **no GUI stack** at
+all — no DWM, no WPF, no shell.
+
+GitHub does offer a `windows-11-arm` runner label, but:
+
+- It is **ARM64**. Most Windows software is x64 and needs emulation.
+- **cloudflared publishes no arm64 Windows build** (only 386/amd64), so the
+  tunnelling binary itself has to run emulated.
+- Streamed output needs a VNC/RDP server *plus* a capturable interactive desktop.
+  A headless runner may only offer session 0, which captures a **black screen**
+  regardless of which server you install.
+
+Rather than guess, there is a **feasibility probe** workflow that answers this in
+about two minutes. It downloads nothing, so a failure is a real signal rather
+than a bad URL:
+
+Actions → **Windows 11 feasibility probe** → **Run workflow**.
+
+It reports a plain verdict:
+
+| Verdict | Meaning |
+|---|---|
+| `VIABLE` | An interactive desktop exists and x86 emulation works — the streaming path is open |
+| `BLOCKED: no interactive desktop` | Any VNC/RDP server captures a black screen. Stop here |
+| `BLOCKED: no x86 emulation` | No tunnelling binary can run either |
+
+Only build a Windows workflow after the probe says `VIABLE`.
+
 ## Using it locally
 
 Same script, no Actions. Useful for debugging a failure before you burn CI
