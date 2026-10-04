@@ -1,0 +1,504 @@
+<#
+.SYNOPSIS
+  Serve a GitHub-hosted windows-11-arm desktop into the browser.
+
+.DESCRIPTION
+  TightVNC captures the desktop, websockify turns VNC into a WebSocket, and a
+  generated noVNC launcher page connects using the page origin so host and port
+  cannot be wrong. cloudflared publishes it over HTTPS.
+
+  Kept as a file rather than inline in the workflow because GitHub treats the
+  whole run: body as one expression and rejects it beyond 21000 characters.
+
+  Every stage is verified before the URL is advertised: the password encryption
+  is checked against a published TightVNC registry value, the written registry
+  value is read back, and a real RFB handshake is performed against the server.
+
+.ENVIRONMENT
+  VNC_PASSWORD_INPUT   optional; blank generates a random one
+  SESSION_MINUTES      how long to hold the tunnel
+  ALLOWED_EMAILS       optional Cloudflare email OTP allowlist
+  VNC_PORT, HTTP_PORT  listen ports (defaults 5900 / 6080)
+  TIGHTVNC_URL, CLOUDFLARED_URL, NOVNC_VERSION
+#>
+$ErrorActionPreference = 'Stop'
+
+$ErrorActionPreference = 'Stop'
+$work = "$env:RUNNER_TEMP\winvnc"
+New-Item -ItemType Directory -Force -Path $work | Out-Null
+$ProgressPreference = 'SilentlyContinue'
+
+# ---------- password ----------
+# VNC truncates to 8 characters, so generate something short and strong.
+$pw = "$env:VNC_PASSWORD_INPUT"
+if ([string]::IsNullOrWhiteSpace($pw)) {
+  $bytes = New-Object byte[] 6
+  [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+  $pw = ([System.BitConverter]::ToString($bytes) -replace '-','').ToLower()
+}
+if ($pw.Length -gt 8) {
+  Write-Host "::warning::VNC passwords are limited to 8 characters; truncating input"
+  $pw = $pw.Substring(0, 8)
+}
+
+# TightVNC stores the password as an 8-byte DES-ECB block of the
+# NUL-padded password, keyed with the fixed key from vncauth.c and
+# with each key byte bit-reversed. The plaintext is NOT reversed.
+#
+# Done in Python because .NET's DES does not produce the same bytes
+# for a bit-reversed key, and the registry value is only correct if
+# it matches byte for byte. cryptography is pinned to 46.0.3: it is
+# the last release publishing a cp3x-abi3 win_arm64 wheel, and later
+# versions have none, which would force a source build like the
+# websockify dependency did.
+$encScript = "$work\vncenc.py"
+$encPy = @(
+  'import sys, warnings'
+  'warnings.filterwarnings("ignore")'
+  'from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES'
+  'from cryptography.hazmat.primitives.ciphers import Cipher, modes'
+  'FIXED = bytes([23, 82, 107, 6, 35, 78, 88, 7])'
+  'KEY = bytes(int(f"{b:08b}"[::-1], 2) for b in FIXED)'
+  'def enc(pw):'
+  '    d = pw.encode("latin-1")[:8].ljust(8, b"\0")'
+  '    c = Cipher(TripleDES(KEY + KEY), modes.ECB()).encryptor()'
+  '    return c.update(d) + c.finalize()'
+  'probe = enc("Secure!")'
+  'if probe.hex().upper() != "D7A514D8C556AADE":'
+  '    print("VNCENC FAIL: got " + probe.hex().upper())'
+  '    sys.exit(1)'
+  'print(enc(sys.argv[1]).hex())'
+)
+Set-Content -Path $encScript -Value $encPy -Encoding utf8
+
+python -m pip install --disable-pip-version-check --log "$pipLog" `
+  "cryptography==46.0.3" 2>&1 | Select-Object -Last 3 | Write-Host
+$encHex = python $encScript $pw
+if ($LASTEXITCODE -ne 0) {
+  Write-Host ($encHex | Out-String)
+  throw "VNC password encryption is WRONG; TightVNC would reject every login"
+}
+$encHex = "$encHex".Trim()
+[byte[]]$pwBlob = @()
+for ($i = 0; $i -lt $encHex.Length; $i += 2) {
+  $pwBlob += [Convert]::ToByte($encHex.Substring($i, 2), 16)
+}
+Write-Host "VNC password encoded (self-test passed): $encHex"
+
+# ---------- install TightVNC ----------
+$msi = "$work\tightvnc.msi"
+Write-Host "downloading TightVNC"
+Invoke-WebRequest -Uri $env:TIGHTVNC_URL -OutFile $msi -UseBasicParsing
+
+# Loopback connections are DISABLED by default, and websockify reaches
+# TightVNC over 127.0.0.1, so the server refuses with "Sorry, loopback
+# connections are not enabled". ALLOWLOOPBACK enables them and
+# LOOPBACKONLY then restricts them to localhost, so 5900 stays
+# unreachable from the runner's network and the tunnel is the only
+# route in.
+#
+# USEVNCAUTHENTICATION forces standard RFB VNC auth (security type 2).
+# Left alone, TightVNC can offer its own proprietary types, which
+# noVNC cannot speak.
+#
+# The password is written to the registry below rather than passed via
+# VALUE_OF_PASSWORD, to keep it out of the process command line.
+Write-Host "installing TightVNC"
+$p = Start-Process msiexec.exe -ArgumentList @(
+  '/i', "`"$msi`"", '/quiet', '/norestart',
+  'SET_USRSC=0', 'SET_VIEWONLY=0', 'ACCEPT_EULA=1',
+  'SET_ALLOWLOOPBACK=1', 'VALUE_OF_ALLOWLOOPBACK=1',
+  'SET_LOOPBACKONLY=1', 'VALUE_OF_LOOPBACKONLY=1',
+  'SET_USEVNCAUTHENTICATION=1', 'VALUE_OF_USEVNCAUTHENTICATION=1'
+) -Wait -PassThru
+if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+  throw "msiexec failed with exit code $($p.ExitCode)"
+}
+
+$tvn = "${env:ProgramFiles}\TightVNC\tvnserver.exe"
+if (-not (Test-Path $tvn)) { throw "tvnserver.exe not found after install" }
+
+# ---------- configure ----------
+$reg = 'HKLM:\SOFTWARE\TightVNC\Server'
+New-Item -Path $reg -Force | Out-Null
+# REG_BINARY, not a hex string: TightVNC reads the raw 8 bytes.
+Set-ItemProperty -Path $reg -Name 'Password'         -Value $pwBlob -Type Binary
+Set-ItemProperty -Path $reg -Name 'ControlPassword'  -Value $pwBlob -Type Binary
+Set-ItemProperty -Path $reg -Name 'PasswordViewOnly' -Value 0 -Type DWord
+Set-ItemProperty -Path $reg -Name 'UseControlAuthentication' -Value 0 -Type DWord
+
+# Read the value back rather than trusting the write. A type or view
+# mismatch here shows up as "Cannot convert value" or an empty result,
+# which is far easier to diagnose than a rejected login later.
+$readBack = (Get-ItemProperty -Path $reg -Name 'Password').Password
+$rbHex = if ($readBack -is [byte[]]) {
+  -join ($readBack | ForEach-Object { $_.ToString('x2') })
+} else { "<not binary: $($readBack.GetType().Name)>" }
+Write-Host "registry Password read back as: $rbHex (expected $encHex)"
+if ($rbHex -ne $encHex) {
+  throw "registry Password does not match what we encoded ($rbHex vs $encHex)"
+}
+Write-Host "registry Password verified"
+# NOTE: loopback access is configured through the MSI properties above
+# (SET_ALLOWLOOPBACK / SET_LOOPBACKONLY). Writing LoopbackOnly or
+# LoopbackPolicy here does nothing: those are not TightVNC registry
+# value names, and their absence is what left the server refusing
+# 127.0.0.1 connections.
+
+# ---------- start the service ----------
+Write-Host "starting TightVNC service"
+$svc = Get-Service -Name 'tvnserver' -ErrorAction SilentlyContinue
+if (-not $svc) { throw "tvnserver service was not created" }
+if ($svc.StartType -ne 'Automatic') { Set-Service -Name 'tvnserver' -StartupType Automatic }
+Start-Service -Name 'tvnserver'
+(Get-Service -Name 'tvnserver').WaitForStatus('Running', [TimeSpan]::FromSeconds(45))
+
+# Confirm it is actually listening before building anything on top.
+$listening = $false
+for ($i = 0; $i -lt 20; $i++) {
+  if (Get-NetTCPConnection -LocalPort $env:VNC_PORT -State Listen -ErrorAction SilentlyContinue) {
+    $listening = $true; break
+  }
+  Start-Sleep -Seconds 2
+}
+if (-not $listening) { throw "TightVNC is not listening on $($env:VNC_PORT)" }
+Write-Host "TightVNC listening on $($env:VNC_PORT)"
+
+# ---------- noVNC ----------
+$novnc = "$work\novnc"
+$tarball = "$work\novnc.tar.gz"
+Write-Host "downloading noVNC $($env:NOVNC_VERSION)"
+Invoke-WebRequest -Uri "https://github.com/novnc/noVNC/archive/refs/tags/$($env:NOVNC_VERSION).tar.gz" -OutFile $tarball -UseBasicParsing
+# GitHub source archives have a single top-level directory.
+tar -xzf $tarball -C $work
+$inner = Get-ChildItem -Directory $work | Where-Object { $_.Name -like 'noVNC-*' } | Select-Object -First 1
+if (-not $inner) { throw "noVNC archive did not extract as expected" }
+Move-Item $inner.FullName $novnc -Force
+if (-not (Test-Path "$novnc\vnc.html")) { throw "vnc.html missing from noVNC" }
+
+# websockify serves the noVNC directory, so the tunnel root lands on a file
+# listing rather than the client. Write our own launcher instead of
+# redirecting to vnc.html: that page's Connect form defaults its Port
+# field to 6080, so clicking Connect builds wss://<tunnel>:6080 and
+# fails, because the tunnel only exposes 443. This page derives the
+# WebSocket URL from the current location, so host and port cannot be
+# wrong, and it supplies the password directly so there is no prompt.
+# Built as an array, not a here-string: a here-string's closing
+# delimiter must sit at column 0 and would break this block scalar.
+$launcher = @(
+  '<!doctype html>'
+  '<html>'
+  '  <head>'
+  '    <meta charset="utf-8">'
+  '    <title>Windows 11 desktop</title>'
+  '    <style>'
+  '      html,body{margin:0;height:100%;background:#111;color:#eee;'
+  '        font:14px system-ui,-apple-system,Segoe UI,sans-serif}'
+  '      #screen{width:100%;height:100%}'
+  '      #status{position:fixed;inset:0;display:flex;align-items:center;'
+  '        justify-content:center;flex-direction:column;gap:.75rem;'
+  '        text-align:center;padding:2rem}'
+  '      code{background:#000;padding:.2rem .45rem;border-radius:.25rem}'
+  '    </style>'
+  '  </head>'
+  '  <body>'
+  '    <div id="screen"></div>'
+  '    <div id="status"><p id="msg">Connecting&hellip;</p>'
+  '      <noscript>This needs JavaScript.</noscript></div>'
+  '    <script type="module">'
+  '      import RFB from "./core/rfb.js";'
+  '      const msg = document.getElementById("msg");'
+  '      const status = document.getElementById("status");'
+  '      try {'
+  # Same-origin WebSocket: correct scheme and port with no guessing.
+  '        const url = new URL("websockify", window.location.href);'
+  '        url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";'
+  '        const rfb = new RFB(document.getElementById("screen"), url.href, {'
+  '          credentials: { password: "__VNC_PASSWORD__" },'
+  '        });'
+  '        rfb.scaleViewport = true;'
+  '        rfb.resizeSession = false;'
+  '        rfb.addEventListener("connect", () => { status.remove(); });'
+  '        rfb.addEventListener("credentialsrequired", () => {'
+  '          msg.textContent = "Server asked for credentials the generated password did not satisfy.";'
+  '        });'
+  '        rfb.addEventListener("desktopname", (ev) => {'
+  '          document.title = ev.detail.name || "Windows 11 desktop";'
+  '        });'
+  '        rfb.addEventListener("disconnect", (ev) => {'
+  # detail carries only { clean }, so reading .reason yields undefined.
+  '          const d = ev.detail || {};'
+  '          msg.textContent = d.clean'
+  '            ? "The session ended."'
+  '            : "Server closed the connection" + (d.reason ? " (" + d.reason + ")" : "") + ". A rejected password looks like this; check the job log for the password self-test.";'
+  '          status.style.display = "flex";'
+  '        });'
+  '      } catch (err) {'
+  '        msg.textContent = "Could not start: " + err;'
+  '      }'
+  '    </script>'
+  '  </body>'
+  '</html>'
+)
+# Splice in the generated password so there is nothing to type.
+($launcher -join "`n") -replace '__VNC_PASSWORD__', $pw |
+  Set-Content -Path "$novnc\index.html" -Encoding utf8
+
+# ---------- websockify ----------
+# Install with --no-deps on purpose. websockify depends on jwcrypto,
+# which depends on cryptography, and cryptography publishes NO
+# win_arm64 wheels at all. A normal install therefore falls back to
+# compiling it from Rust source (maturin/cargo) and dies on an ARM64
+# runner. jwcrypto is only used for JWT token auth in
+# token_plugins.py, which this proxy path never imports: __main__.py
+# imports only websockify, and websockify/__init__.py imports just
+# websocket + websocketproxy. numpy has win_arm64 wheels, so it is
+# safe to install normally.
+Write-Host "installing websockify (no-deps; see comment for why)"
+$pipLog = "$work\pip.log"
+python -m pip install --disable-pip-version-check --log "$pipLog" numpy 2>&1 |
+  Select-Object -Last 5 | Write-Host
+if ($LASTEXITCODE -ne 0) { throw "numpy install failed (needs a win_arm64 wheel); see $pipLog" }
+python -m pip install --disable-pip-version-check --log "$pipLog" --no-deps websockify 2>&1 |
+  Select-Object -Last 5 | Write-Host
+if ($LASTEXITCODE -ne 0) { throw "websockify install failed; see $pipLog" }
+
+# Exercise the real import path rather than trusting the exit code.
+$probe = python -c "import websockify, numpy; print('websockify import OK, numpy', numpy.__version__)" 2>&1
+if ($LASTEXITCODE -ne 0) {
+  Write-Host $probe
+  throw "websockify import failed: $probe"
+}
+Write-Host $probe
+
+$log = "$work\websockify.log"
+Write-Host "starting websockify on $($env:HTTP_PORT) -> $($env:VNC_PORT)"
+$ws = Start-Process python -ArgumentList @(
+  '-m', 'websockify',
+  '--web', $novnc,
+  $env:HTTP_PORT, "127.0.0.1:$($env:VNC_PORT)"
+) -RedirectStandardOutput $log -RedirectStandardError "$work\websockify.err" -PassThru
+
+$up = $false
+for ($i = 0; $i -lt 30; $i++) {
+  try {
+    $r = Invoke-WebRequest -Uri "http://127.0.0.1:$($env:HTTP_PORT)/vnc.html" -UseBasicParsing -TimeoutSec 4
+    if ($r.StatusCode -eq 200) { $up = $true; break }
+  } catch {}
+  if ($ws.HasExited) { break }
+  Start-Sleep -Seconds 2
+}
+if (-not $up) {
+  Get-Content $log, "$work\websockify.err" -ErrorAction SilentlyContinue | Write-Host
+  throw "websockify did not serve vnc.html on port $($env:HTTP_PORT)"
+}
+Write-Host "noVNC served locally on $($env:HTTP_PORT)"
+
+# ---------- prove RFB and the password, inside CI ----------
+# The browser only reports "connection closed", which cannot be told
+# apart from a rejected password. Speak RFB to TightVNC directly so
+# the real cause is named: which security types it offers, and whether
+# the challenge/response is accepted.
+$rfbScript = "$work\vnccheck.py"
+$rfbPy = @(
+  'import socket, struct, sys, warnings'
+  'warnings.filterwarnings("ignore")'
+  'h, p, pw = sys.argv[1], int(sys.argv[2]), sys.argv[3]'
+  'def out(m): print(m)'
+  'def bad(m):'
+  '    print("RFB FAIL: " + m)'
+  '    sys.exit(1)'
+  'try:'
+  '    s = socket.create_connection((h, p), timeout=10)'
+  'except Exception as e:'
+  '    bad("cannot TCP-connect to %s:%d (%s)" % (h, p, e))'
+  's.settimeout(10)'
+  'def line():'
+  '    b = b""'
+  '    while not b.endswith(b"\n"):'
+  '        c = s.recv(1)'
+  '        if not c: bad("server closed before completing a line")'
+  '        b += c'
+  '    return b.strip().decode("latin-1")'
+  'def exact(n):'
+  '    b = b""'
+  '    while len(b) < n:'
+  '        c = s.recv(n - len(b))'
+  '        if not c: return b'
+  '        b += c'
+  '    return b'
+  'v = line()'
+  'out("RFB version    : " + v)'
+  'if not v.startswith("RFB"): bad("not an RFB server: " + repr(v))'
+  's.sendall(b"RFB 003.008\n")'
+  'hd = exact(1)'
+  'if not hd: bad("closed during security negotiation")'
+  'n = hd[0]'
+  'if n == 0:'
+  '    r = exact(4)'
+  '    ln = struct.unpack(">I", r)[0] if len(r) == 4 else 0'
+  '    bad("server REFUSED: " + exact(ln).decode("latin-1"))'
+  'types = exact(n)'
+  'out("security types : " + str(list(types)) + "  (1=None, 2=VNC auth)")'
+  'if 2 not in types:'
+  '    s.close()'
+  '    if 1 in types: bad("server offers NO password (type 1) but a password is set")'
+  '    bad("VNC auth (type 2) not offered; types=" + str(list(types)))'
+  's.sendall(bytes([2]))'
+  'ch = exact(16)'
+  'if len(ch) < 16: bad("closed before sending the 16-byte challenge")'
+  'out("challenge      : " + ch.hex())'
+  'from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES'
+  'from cryptography.hazmat.primitives.ciphers import Cipher, modes'
+  'k = pw.encode("latin-1")[:8].ljust(8, b"\0")'
+  'k = bytes(int(format(x, "08b")[::-1], 2) for x in k)'
+  'd = Cipher(TripleDES(k + k), modes.ECB()).decryptor()'
+  'resp = d.update(ch[:8]) + d.update(ch[8:16])'
+  'out("password       : " + repr(pw))'
+  'out("response       : " + resp.hex())'
+  's.sendall(resp)'
+  'r = exact(4)'
+  's.close()'
+  'if len(r) < 4: bad("server closed with no SecurityResult -> password REJECTED")'
+  'code = struct.unpack(">I", r)[0]'
+  'if code != 0:'
+  '    bad("password REJECTED (SecurityResult=%d)" % code)'
+  'out("RFB OK: password accepted, handshake completed")'
+)
+Set-Content -Path $rfbScript -Value $rfbPy -Encoding utf8
+$rfbOut = python $rfbScript "127.0.0.1" $env:VNC_PORT $pw 2>&1
+$rfbCode = $LASTEXITCODE
+$rfbOut | ForEach-Object { Write-Host $_ }
+$rfbLine = ($rfbOut | Select-Object -Last 1)
+if ($rfbCode -eq 0) {
+  Write-Host "VNC password verified against the live server"
+} else {
+  Write-Host "::warning::RFB check failed: $rfbLine"
+}
+
+# ---------- verify the encryption against a known-good vector ----------
+# A browser that connects and is immediately dropped is the classic
+# RFB signature of a rejected password, which is nearly impossible to
+# diagnose from the browser alone. The helper above encrypts a
+# documented password and requires the published TightVNC value
+# before anything is advertised, so a wrong key or byte order fails
+# here with a clear message instead.
+
+# ---------- cloudflared ----------
+$cf = "$work\cloudflared.exe"
+Write-Host "downloading cloudflared (amd64, runs emulated on ARM64)"
+Invoke-WebRequest -Uri $env:CLOUDFLARED_URL -OutFile $cf -UseBasicParsing
+$cfVersion = (& $cf --version 2>&1 | Out-String).Trim()
+Write-Host "cloudflared: $cfVersion"
+
+$cfLog = "$work\cloudflared.log"
+$cfErr = "$work\cf.err"
+$mailArgs = @()
+if (-not [string]::IsNullOrWhiteSpace("$env:ALLOWED_EMAILS")) {
+  $mailArgs = @('--allowed-mail', '$env:ALLOWED_EMAILS')
+}
+# Start-Process cannot send stdout and stderr to the same file, so they
+# are kept apart. cloudflared is a Go program and writes its log to
+# STDERR, which is where the tunnel URL actually appears, so both files
+# must be searched.
+$cfProc = Start-Process $cf -ArgumentList (@('tunnel','--no-autoupdate','--url',"http://127.0.0.1:$($env:HTTP_PORT)") + $mailArgs) -RedirectStandardOutput $cfLog -RedirectStandardError $cfErr -PassThru
+
+$url = $null
+for ($i = 0; $i -lt 45; $i++) {
+  $combined = ((Get-Content $cfLog -ErrorAction SilentlyContinue) +
+     (Get-Content $cfErr -ErrorAction SilentlyContinue)) -join "`n"
+  if ($combined) {
+    $m = [regex]::Match($combined, 'https://[a-zA-Z0-9-]+\.trycloudflare\.com')
+    if ($m.Success) { $url = $m.Value; break }
+  }
+  if ($cfProc.HasExited) { break }
+  Start-Sleep -Seconds 2
+}
+if (-not $url) {
+  Get-Content $cfLog, $cfErr -ErrorAction SilentlyContinue | Write-Host
+  throw "cloudflared did not report a tunnel URL"
+}
+Write-Host "public URL: $url"
+
+# ---------- outputs ----------
+"url=$url"      >> $env:GITHUB_OUTPUT
+"password=$pw"  >> $env:GITHUB_OUTPUT
+"work_dir=$work"   >> $env:GITHUB_OUTPUT
+"rfb_status=$rfbLine" >> $env:GITHUB_OUTPUT
+
+# ---------- verify the tunnel actually serves traffic ----------
+# Creating the tunnel is not proof it works. A connector that died or
+# was never reachable yields Cloudflare error 1033 in the browser, so
+# confirm end to end from inside the runner before advertising it.
+Write-Host "verifying the public URL end to end"
+$verdict = "unreachable"
+for ($i = 0; $i -lt 20; $i++) {
+  try {
+    $r = Invoke-WebRequest -Uri "$url/vnc.html" -UseBasicParsing -TimeoutSec 10
+    if ($r.StatusCode -eq 200) { $verdict = "ok"; break }
+  } catch {
+    $resp = $_.Exception.Response
+    if ($resp -and [int]$resp.StatusCode -eq 200) { $verdict = "ok"; break }
+    if ($_.Exception.Message -match '1033') { $verdict = 'error 1033 (no connector)' }
+  }
+  Start-Sleep -Seconds 5
+}
+Write-Host "public URL check: $verdict"
+if ($verdict -ne "ok") {
+  Write-Host "::warning::The tunnel is up but $verdict. The URL may still settle; see Diagnostics."
+}
+
+# ---------- publish ----------
+{
+  "## Windows 11 desktop"
+  ""
+  "### [$url]($url)"
+  ""
+  "| | |"
+  "|---|---|"
+  "| Password | ``$pw`` |"
+  "| VNC password limit | 8 characters |"
+  "| Public URL check | $verdict |"
+  '| VNC password check | $rfbLine |'
+  "| Ends | ~$env:SESSION_MINUTES min, or when you cancel |"
+  ""
+  "If the page shows **Cloudflare Tunnel error 1033**, the tunnel is not"
+  "connected yet; wait a few seconds and reload."
+  ""
+  "Anyone with the URL can reach the VNC login. Cancel the job to kill it."
+  if (-not [string]::IsNullOrWhiteSpace("$env:ALLOWED_EMAILS")) {
+    ""
+    "Access is additionally gated by a Cloudflare one-time PIN."
+  }
+} | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+# ---------- hold the session, in THIS step ----------
+# This must not be a separate step: on Windows runners a process
+# started with Start-Process is torn down when its step ends, which
+# killed cloudflared and produced error 1033. Keeping the loop here
+# means the processes stay alive for as long as the tunnel is needed.
+$mins = [Math]::Min([int]"$env:SESSION_MINUTES", 355)
+$end = (Get-Date).AddMinutes($mins)
+Write-Host "holding for $mins min"
+while ((Get-Date) -lt $end) {
+  $svc = Get-Service -Name 'tvnserver' -ErrorAction SilentlyContinue
+  if (-not $svc -or $svc.Status -ne 'Running') {
+    Write-Host "::error::tvnserver stopped; desktop is gone"
+    exit 1
+  }
+  # The tunnel is the thing that actually dies, so watch the process
+  # and not just the VNC service.
+  if ($cfProc.HasExited) {
+    Write-Host "::error::cloudflared exited with code $($cfProc.ExitCode); the public URL is dead"
+    exit 1
+  }
+  if ($ws.HasExited) {
+    Write-Host "::error::websockify exited with code $($ws.ExitCode)"
+    exit 1
+  }
+  $left = [int]($end - (Get-Date)).TotalMinutes
+  Write-Host "alive, $left min remaining"
+  Start-Sleep -Seconds 20
+}
+Write-Host "session window elapsed"
+
