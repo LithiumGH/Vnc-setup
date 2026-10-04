@@ -85,6 +85,8 @@ for ($i = 0; $i -lt $encHex.Length; $i += 2) {
 }
 Write-Host "VNC password encoded (self-test passed): $encHex"
 
+# cryptography is still needed below for the RFB challenge-response check.
+
 # ---------- install TightVNC ----------
 $msi = "$work\tightvnc.msi"
 Write-Host "downloading TightVNC"
@@ -124,26 +126,26 @@ $tvn = "${env:ProgramFiles}\TightVNC\tvnserver.exe"
 if (-not (Test-Path $tvn)) { throw "tvnserver.exe not found after install" }
 
 # ---------- configure ----------
+# The password is NOT written here. It goes in through the installer's
+# VALUE_OF_PASSWORD above, so TightVNC encrypts it with its own code. An earlier
+# version also wrote the registry itself, giving two sources of truth for the
+# same value; the server then refused connections outright rather than accepting
+# one of them. Let the vendor's installer own the value.
 $reg = 'HKLM:\SOFTWARE\TightVNC\Server'
 New-Item -Path $reg -Force | Out-Null
-# REG_BINARY, not a hex string: TightVNC reads the raw 8 bytes.
-Set-ItemProperty -Path $reg -Name 'Password'         -Value $pwBlob -Type Binary
-Set-ItemProperty -Path $reg -Name 'ControlPassword'  -Value $pwBlob -Type Binary
 Set-ItemProperty -Path $reg -Name 'PasswordViewOnly' -Value 0 -Type DWord
 Set-ItemProperty -Path $reg -Name 'UseControlAuthentication' -Value 0 -Type DWord
 
-# Read the value back rather than trusting the write. A type or view
-# mismatch here shows up as "Cannot convert value" or an empty result,
-# which is far easier to diagnose than a rejected login later.
-$readBack = (Get-ItemProperty -Path $reg -Name 'Password').Password
+# Report what the installer actually stored, so it is visible in the log.
+$readBack = (Get-ItemProperty -Path $reg -Name 'Password' -ErrorAction SilentlyContinue).Password
 $rbHex = if ($readBack -is [byte[]]) {
   -join ($readBack | ForEach-Object { $_.ToString('x2') })
-} else { "<not binary: $($readBack.GetType().Name)>" }
-Write-Host "registry Password read back as: $rbHex (expected $encHex)"
-if ($rbHex -ne $encHex) {
-  throw "registry Password does not match what we encoded ($rbHex vs $encHex)"
+} elseif ($null -eq $readBack) {
+  "<absent>"
+} else {
+  "<not binary: $($readBack.GetType().Name)>"
 }
-Write-Host "registry Password verified"
+Write-Host "installer stored Password as: $rbHex"
 # NOTE: loopback access is configured through the MSI properties above
 # (SET_ALLOWLOOPBACK / SET_LOOPBACKONLY). Writing LoopbackOnly or
 # LoopbackPolicy here does nothing: those are not TightVNC registry
@@ -366,7 +368,12 @@ $rfbPy = @(
   '            return False, "closed during negotiation"'
   '        n = hd[0]'
   '        if n == 0:'
-  '            return False, "server refused"'
+  # A zero count means the server sent a failure reason string. Discarding it
+  # is what left earlier runs reporting a bare "server refused".
+  '            r = exact(4)'
+  '            ln = struct.unpack(">I", r)[0] if len(r) == 4 else 0'
+  '            reason = exact(ln).decode("latin-1", "replace") if ln else "(no reason given)"'
+  '            return False, "server refused: " + reason'
   '        types = exact(n)'
   '        if 2 not in types:'
   '            s.close()'
@@ -526,7 +533,14 @@ if ($verdict -ne "ok") {
 # started with Start-Process is torn down when its step ends, which
 # killed cloudflared and produced error 1033. Keeping the loop here
 # means the processes stay alive for as long as the tunnel is needed.
-$mins = [Math]::Min([int]"$env:SESSION_MINUTES", 355)
+# Validate rather than trusting the input. A malformed value previously killed
+# the script here, after the tunnel was already published and holding.
+$rawMinutes = "$env:SESSION_MINUTES"
+if ($rawMinutes -notmatch '^\s*(\d+)\s*$') {
+  Write-Host "::warning::session_minutes was '$rawMinutes', which is not a whole number; using 120"
+  $rawMinutes = "120"
+}
+$mins = [Math]::Min([int]$rawMinutes, 355)
 $end = (Get-Date).AddMinutes($mins)
 Write-Host "holding for $mins min"
 while ((Get-Date) -lt $end) {
