@@ -142,6 +142,19 @@ jobs:
           Set-ItemProperty -Path $reg -Name 'ControlPassword'  -Value $pwBlob -Type Binary
           Set-ItemProperty -Path $reg -Name 'PasswordViewOnly' -Value 0 -Type DWord
           Set-ItemProperty -Path $reg -Name 'UseControlAuthentication' -Value 0 -Type DWord
+
+          # Read the value back rather than trusting the write. A type or view
+          # mismatch here shows up as "Cannot convert value" or an empty result,
+          # which is far easier to diagnose than a rejected login later.
+          $readBack = (Get-ItemProperty -Path $reg -Name 'Password').Password
+          $rbHex = if ($readBack -is [byte[]]) {
+            -join ($readBack | ForEach-Object { $_.ToString('x2') })
+          } else { "<not binary: $($readBack.GetType().Name)>" }
+          Write-Host "registry Password read back as: $rbHex (expected $encHex)"
+          if ($rbHex -ne $encHex) {
+            throw "registry Password does not match what we encoded ($rbHex vs $encHex)"
+          }
+          Write-Host "registry Password verified"
           # Bind loopback only. The tunnel is the only route in, so there is no
           # reason to expose 5900 on the runner's own interfaces.
           Set-ItemProperty -Path $reg -Name 'LoopbackOnly'      -Value 1 -Type DWord
@@ -297,6 +310,88 @@ jobs:
           }
           Write-Host "noVNC served locally on $($env:HTTP_PORT)"
 
+          # ---------- prove RFB and the password, inside CI ----------
+          # The browser only reports "connection closed", which cannot be told
+          # apart from a rejected password. Speak RFB to TightVNC directly so
+          # the real cause is named: which security types it offers, and whether
+          # the challenge/response is accepted.
+          $rfbScript = "$work\vnccheck.py"
+          $rfbPy = @(
+            'import socket, struct, sys, warnings'
+            'warnings.filterwarnings("ignore")'
+            'h, p, pw = sys.argv[1], int(sys.argv[2]), sys.argv[3]'
+            'def out(m): print(m)'
+            'def bad(m):'
+            '    print("RFB FAIL: " + m)'
+            '    sys.exit(1)'
+            'try:'
+            '    s = socket.create_connection((h, p), timeout=10)'
+            'except Exception as e:'
+            '    bad("cannot TCP-connect to %s:%d (%s)" % (h, p, e))'
+            's.settimeout(10)'
+            'def line():'
+            '    b = b""'
+            '    while not b.endswith(b"\n"):'
+            '        c = s.recv(1)'
+            '        if not c: bad("server closed before completing a line")'
+            '        b += c'
+            '    return b.strip().decode("latin-1")'
+            'def exact(n):'
+            '    b = b""'
+            '    while len(b) < n:'
+            '        c = s.recv(n - len(b))'
+            '        if not c: return b'
+            '        b += c'
+            '    return b'
+            'v = line()'
+            'out("RFB version    : " + v)'
+            'if not v.startswith("RFB"): bad("not an RFB server: " + repr(v))'
+            's.sendall(b"RFB 003.008\n")'
+            'hd = exact(1)'
+            'if not hd: bad("closed during security negotiation")'
+            'n = hd[0]'
+            'if n == 0:'
+            '    r = exact(4)'
+            '    ln = struct.unpack(">I", r)[0] if len(r) == 4 else 0'
+            '    bad("server REFUSED: " + exact(ln).decode("latin-1"))'
+            'types = exact(n)'
+            'out("security types : " + str(list(types)) + "  (1=None, 2=VNC auth)")'
+            'if 2 not in types:'
+            '    s.close()'
+            '    if 1 in types: bad("server offers NO password (type 1) but a password is set")'
+            '    bad("VNC auth (type 2) not offered; types=" + str(list(types)))'
+            's.sendall(bytes([2]))'
+            'ch = exact(16)'
+            'if len(ch) < 16: bad("closed before sending the 16-byte challenge")'
+            'out("challenge      : " + ch.hex())'
+            'from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES'
+            'from cryptography.hazmat.primitives.ciphers import Cipher, modes'
+            'k = pw.encode("latin-1")[:8].ljust(8, b"\0")'
+            'k = bytes(int(format(x, "08b")[::-1], 2) for x in k)'
+            'd = Cipher(TripleDES(k + k), modes.ECB()).decryptor()'
+            'resp = d.update(ch[:8]) + d.update(ch[8:16])'
+            'out("password       : " + repr(pw))'
+            'out("response       : " + resp.hex())'
+            's.sendall(resp)'
+            'r = exact(4)'
+            's.close()'
+            'if len(r) < 4: bad("server closed with no SecurityResult -> password REJECTED")'
+            'code = struct.unpack(">I", r)[0]'
+            'if code != 0:'
+            '    bad("password REJECTED (SecurityResult=%d)" % code)'
+            'out("RFB OK: password accepted, handshake completed")'
+          )
+          Set-Content -Path $rfbScript -Value $rfbPy -Encoding utf8
+          $rfbOut = python $rfbScript "127.0.0.1" $env:VNC_PORT $pw 2>&1
+          $rfbCode = $LASTEXITCODE
+          $rfbOut | ForEach-Object { Write-Host $_ }
+          $rfbLine = ($rfbOut | Select-Object -Last 1)
+          if ($rfbCode -eq 0) {
+            Write-Host "VNC password verified against the live server"
+          } else {
+            Write-Host "::warning::RFB check failed: $rfbLine"
+          }
+
           # ---------- verify the encryption against a known-good vector ----------
           # A browser that connects and is immediately dropped is the classic
           # RFB signature of a rejected password, which is nearly impossible to
@@ -345,6 +440,7 @@ jobs:
           "url=$url"      >> $env:GITHUB_OUTPUT
           "password=$pw"  >> $env:GITHUB_OUTPUT
           "work_dir=$work"   >> $env:GITHUB_OUTPUT
+          "rfb_status=$rfbLine" >> $env:GITHUB_OUTPUT
 
           # ---------- verify the tunnel actually serves traffic ----------
           # Creating the tunnel is not proof it works. A connector that died or
@@ -379,6 +475,7 @@ jobs:
             "| Password | ``$pw`` |"
             "| VNC password limit | 8 characters |"
             "| Public URL check | $verdict |"
+            '| VNC password check | $rfbLine |'
             "| Ends | ~${{ inputs.session_minutes }} min, or when you cancel |"
             ""
             "If the page shows **Cloudflare Tunnel error 1033**, the tunnel is not"
