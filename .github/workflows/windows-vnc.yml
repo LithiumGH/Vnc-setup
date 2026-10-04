@@ -71,18 +71,49 @@ jobs:
             $pw = $pw.Substring(0, 8)
           }
 
-          # TightVNC stores the password in the registry as a DES-encrypted,
-          # reversed, zero-padded 8-byte block under a fixed key.
-          $key = [byte[]](0x23,0x87,0x4E,0x38,0x5A,0x39,0x73,0x4C)
-          $pwBytes = [System.Text.Encoding]::ASCII.GetBytes($pw)
-          $pad = New-Object byte[] 8
-          [Array]::Copy($pwBytes, $pad, $pwBytes.Length)
-          [Array]::Reverse($pad)
-          $des = [System.Security.Cryptography.DES]::Create()
-          $des.Mode = 'ECB'; $des.Padding = 'None'; $des.Key = $key
-          $enc = $des.CreateEncryptor().TransformFinalBlock($pad, 0, 8)
-          $pwHex = -join ($enc | ForEach-Object { $_.ToString('x2') })
-          $des.Dispose()
+          # TightVNC stores the password as an 8-byte DES-ECB block of the
+          # NUL-padded password, keyed with the fixed key from vncauth.c and
+          # with each key byte bit-reversed. The plaintext is NOT reversed.
+          #
+          # Done in Python because .NET's DES does not produce the same bytes
+          # for a bit-reversed key, and the registry value is only correct if
+          # it matches byte for byte. cryptography is pinned to 46.0.3: it is
+          # the last release publishing a cp3x-abi3 win_arm64 wheel, and later
+          # versions have none, which would force a source build like the
+          # websockify dependency did.
+          $encScript = "$work\vncenc.py"
+          $encPy = @(
+            'import sys, warnings'
+            'warnings.filterwarnings("ignore")'
+            'from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES'
+            'from cryptography.hazmat.primitives.ciphers import Cipher, modes'
+            'FIXED = bytes([23, 82, 107, 6, 35, 78, 88, 7])'
+            'KEY = bytes(int(f"{b:08b}"[::-1], 2) for b in FIXED)'
+            'def enc(pw):'
+            '    d = pw.encode("latin-1")[:8].ljust(8, b"\0")'
+            '    c = Cipher(TripleDES(KEY + KEY), modes.ECB()).encryptor()'
+            '    return c.update(d) + c.finalize()'
+            'probe = enc("Secure!")'
+            'if probe.hex().upper() != "D7A514D8C556AADE":'
+            '    print("VNCENC FAIL: got " + probe.hex().upper())'
+            '    sys.exit(1)'
+            'print(enc(sys.argv[1]).hex())'
+          )
+          Set-Content -Path $encScript -Value $encPy -Encoding utf8
+
+          python -m pip install --disable-pip-version-check --log "$pipLog" `
+            "cryptography==46.0.3" 2>&1 | Select-Object -Last 3 | Write-Host
+          $encHex = python $encScript $pw
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host ($encHex | Out-String)
+            throw "VNC password encryption is WRONG; TightVNC would reject every login"
+          }
+          $encHex = "$encHex".Trim()
+          [byte[]]$pwBlob = @()
+          for ($i = 0; $i -lt $encHex.Length; $i += 2) {
+            $pwBlob += [Convert]::ToByte($encHex.Substring($i, 2), 16)
+          }
+          Write-Host "VNC password encoded (self-test passed): $encHex"
 
           # ---------- install TightVNC ----------
           $msi = "$work\tightvnc.msi"
@@ -106,9 +137,10 @@ jobs:
           # ---------- configure ----------
           $reg = 'HKLM:\SOFTWARE\TightVNC\Server'
           New-Item -Path $reg -Force | Out-Null
-          Set-ItemProperty -Path $reg -Name 'Password'          -Value $pwHex
-          Set-ItemProperty -Path $reg -Name 'PasswordViewOnly'  -Value 0 -Type DWord
-          Set-ItemProperty -Path $reg -Name 'ControlPassword'   -Value $pwHex
+          # REG_BINARY, not a hex string: TightVNC reads the raw 8 bytes.
+          Set-ItemProperty -Path $reg -Name 'Password'         -Value $pwBlob -Type Binary
+          Set-ItemProperty -Path $reg -Name 'ControlPassword'  -Value $pwBlob -Type Binary
+          Set-ItemProperty -Path $reg -Name 'PasswordViewOnly' -Value 0 -Type DWord
           Set-ItemProperty -Path $reg -Name 'UseControlAuthentication' -Value 0 -Type DWord
           # Bind loopback only. The tunnel is the only route in, so there is no
           # reason to expose 5900 on the runner's own interfaces.
@@ -197,7 +229,11 @@ jobs:
             '          document.title = ev.detail.name || "Windows 11 desktop";'
             '        });'
             '        rfb.addEventListener("disconnect", (ev) => {'
-            '          msg.innerHTML = "Disconnected: " + (ev.detail.clean ? "session ended" : ev.detail.reason);'
+            # detail carries only { clean }, so reading .reason yields undefined.
+            '          const d = ev.detail || {};'
+            '          msg.textContent = d.clean'
+            '            ? "The session ended."'
+            '            : "Server closed the connection" + (d.reason ? " (" + d.reason + ")" : "") + ". A rejected password looks like this; check the job log for the password self-test.";'
             '          status.style.display = "flex";'
             '        });'
             '      } catch (err) {'
@@ -260,6 +296,14 @@ jobs:
             throw "websockify did not serve vnc.html on port $($env:HTTP_PORT)"
           }
           Write-Host "noVNC served locally on $($env:HTTP_PORT)"
+
+          # ---------- verify the encryption against a known-good vector ----------
+          # A browser that connects and is immediately dropped is the classic
+          # RFB signature of a rejected password, which is nearly impossible to
+          # diagnose from the browser alone. The helper above encrypts a
+          # documented password and requires the published TightVNC value
+          # before anything is advertised, so a wrong key or byte order fails
+          # here with a clear message instead.
 
           # ---------- cloudflared ----------
           $cf = "$work\cloudflared.exe"
