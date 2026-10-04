@@ -147,6 +147,31 @@ jobs:
           Move-Item $inner.FullName $novnc -Force
           if (-not (Test-Path "$novnc\vnc.html")) { throw "vnc.html missing from noVNC" }
 
+          # websockify serves the noVNC directory, so hitting the tunnel root
+          # lands on a file listing instead of the client. Drop an index.html
+          # that forwards to the full client, so the advertised URL opens the
+          # desktop directly. It also passes host/port along, because vnc.html
+          # defaults its WebSocket to port 6080 when one is not specified.
+          @'
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="refresh" content="0; url=vnc.html?host=__HOST__&port=__PORT__&autoconnect=true&resize=scale">
+    <title>Redirecting to the desktop</title>
+    <style>body{font:14px system-ui,sans-serif;padding:2rem}a{color:#0645ad}</style>
+  </head>
+  <body>
+    <p>Connecting to the desktop&hellip;</p>
+    <p>If nothing happens, <a href="vnc.html?host=__HOST__&port=__PORT__&autoconnect=true&resize=scale">click here</a>.</p>
+  </body>
+</html>
+'@ | Set-Content -Path "$novnc\index.html" -Encoding utf8
+          (Get-Content "$novnc\index.html" -Raw) `
+            -replace '__HOST__', 'window.location.hostname' `
+            -replace '__PORT__', 'window.location.port' |
+            Set-Content -Path "$novnc\index.html" -Encoding utf8
+
           # ---------- websockify ----------
           # Install with --no-deps on purpose. websockify depends on jwcrypto,
           # which depends on cryptography, and cryptography publishes NO
