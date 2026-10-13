@@ -1,7 +1,28 @@
 # Packages added inside the desktop, reinstalled on the next run.
 # Regenerate with: ./scripts/desktop.sh snapshot
 # One package per line; lines starting with # are ignored.
+appstream
 cowsay
 fastfetch
+flite
+gh
+gstreamer1-plugins-good
+gtksourceview5
+hidapi
+hyphen
+javascriptcoregtk6.0
+libadwaita
+libavif
+libfyaml
+libmanette
+libshout
+libv4l
+libxmlb
+libyuv
+scrot
 sl
+taglib
+wavpack
+webkitgtk6.0
+xdg-dbus-proxy
 yyjson
