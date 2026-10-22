@@ -23,10 +23,12 @@
 #>
 $ErrorActionPreference = 'Stop'
 
-$ErrorActionPreference = 'Stop'
 $work = "$env:RUNNER_TEMP\winvnc"
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 $ProgressPreference = 'SilentlyContinue'
+# Referenced by every pip call in this script; defined here so it can never be
+# empty when an early step (cryptography below) installs first.
+$pipLog = "$work\pip.log"
 
 # ---------- password ----------
 # VNC truncates to 8 characters, so generate something short and strong.
@@ -260,7 +262,6 @@ $launcher = @(
 ($launcher -join "`n") -replace '__VNC_PASSWORD__', $pw |
   Set-Content -Path "$novnc\index.html" -Encoding utf8
 
-# ---------- websockify ----------
 # Install with --no-deps on purpose. websockify depends on jwcrypto,
 # which depends on cryptography, and cryptography publishes NO
 # win_arm64 wheels at all. A normal install therefore falls back to
@@ -270,8 +271,8 @@ $launcher = @(
 # imports only websockify, and websockify/__init__.py imports just
 # websocket + websocketproxy. numpy has win_arm64 wheels, so it is
 # safe to install normally.
+# ---------- websockify ----------
 Write-Host "installing websockify (no-deps; see comment for why)"
-$pipLog = "$work\pip.log"
 python -m pip install --disable-pip-version-check --log "$pipLog" numpy 2>&1 |
   Select-Object -Last 5 | Write-Host
 if ($LASTEXITCODE -ne 0) { throw "numpy install failed (needs a win_arm64 wheel); see $pipLog" }
@@ -451,7 +452,9 @@ $cfLog = "$work\cloudflared.log"
 $cfErr = "$work\cf.err"
 $mailArgs = @()
 if (-not [string]::IsNullOrWhiteSpace("$env:ALLOWED_EMAILS")) {
-  $mailArgs = @('--allowed-mail', '$env:ALLOWED_EMAILS')
+  # Passed split, not as one string: Start-Process does not parse, and
+  # '--allowed-mail x@y' as a single argument would never match the flag.
+  $mailArgs = @('--allowed-mail', $env:ALLOWED_EMAILS)
 }
 # Start-Process cannot send stdout and stderr to the same file, so they
 # are kept apart. cloudflared is a Go program and writes its log to
@@ -515,7 +518,7 @@ if ($verdict -ne "ok") {
   "| Password | ``$pw`` |"
   "| VNC password limit | 8 characters |"
   "| Public URL check | $verdict |"
-  '| VNC password check | $rfbLine |'
+  "| VNC password check | $rfbLine |"
   "| Ends | ~$env:SESSION_MINUTES min, or when you cancel |"
   ""
   "If the page shows **Cloudflare Tunnel error 1033**, the tunnel is not"
