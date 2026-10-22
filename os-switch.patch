@@ -1,0 +1,420 @@
+From 11ad61e698f232f13e793e17b16296360dc94b36 Mon Sep 17 00:00:00 2001
+From: OpenCode <opencode@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 17:35:56 +0000
+Subject: [PATCH 1/2] workflow: switch the desktop OS from one dispatch (Linux
+ / Windows)
+
+One workflow now offers an os input: linux (flavor dropdown, Mint by
+default) or windows-11 (the former standalone Windows VNC job, folded in
+with no behavior change). Concurrency groups stay separate so a Linux and
+a Windows desktop can run side by side.
+---
+ .github/workflows/desktop.yml     | 93 +++++++++++++++++++++++++++----
+ .github/workflows/windows-vnc.yml | 85 ----------------------------
+ 2 files changed, 82 insertions(+), 96 deletions(-)
+ delete mode 100644 .github/workflows/windows-vnc.yml
+
+diff --git a/.github/workflows/desktop.yml b/.github/workflows/desktop.yml
+index 4cb15b2..dd40a28 100644
+--- a/.github/workflows/desktop.yml
++++ b/.github/workflows/desktop.yml
+@@ -1,20 +1,35 @@
+-name: Linux Desktop (browser VNC)
++name: Browser Desktop (Linux or Windows)
+ 
+-# Spins up a real Linux desktop (XFCE by default) on a GitHub-hosted runner and
+-# streams it to your browser over HTTPS. The runner has no inbound ports, so the
+-# desktop is published through a Cloudflare Quick Tunnel, which needs no account.
++# One dispatch, one OS picker: stream a Linux desktop (Mint's Cinnamon by
++# default, or Ubuntu/Fedora/Debian/Arch flavors) OR a Windows 11 desktop to the
++# browser over HTTPS. The runner has no inbound ports, so the desktop is
++# published through a Cloudflare Quick Tunnel, which needs no account.
+ #
+ # The session is ephemeral: it dies when the job ends or you cancel it, and the
+ # public URL stops working at that moment.
++#
++# The two jobs below mirror that switch: only one runs, chosen by the `os`
++# input. They could not share a runner — one needs Windows and dockerd, the
++# other Docker and a Linux GUI stack — so the split is structural, not cosmetic.
+ 
+ on:
+   workflow_dispatch:
+     inputs:
++      os:
++        description: Desktop operating system
++        type: choice
++        default: linux
++        options:
++          - linux
++          - windows-11
+       flavor:
+-        description: Distro and desktop flavor
++        description: Linux distro and desktop flavor (ignored for Windows)
+         type: choice
+-        default: fedora-xfce
++        default: mint-cinnamon
+         options:
++          # Linux Mint's desktop: the closest Windows-like option that works on
++          # these runners. Built on the fly from scripts/mint-cinnamon.Dockerfile.
++          - mint-cinnamon
+           - ubuntu-xfce
+           - ubuntu-mate
+           - ubuntu-kde
+@@ -75,7 +90,7 @@ on:
+         type: boolean
+         default: true
+       runner:
+-        description: Runner label. Use "self-hosted, gpu" for your own GPU box
++        description: Runner label for Linux. Use "self-hosted, gpu" for your own GPU box
+         type: string
+         default: ubuntu-latest
+       gpu:
+@@ -94,14 +109,17 @@ on:
+ permissions:
+   contents: read
+ 
+-# One desktop at a time; a second run would fight over the same ports.
++# Cancel in progress, but keep Linux and Windows groups apart: a Linux desktop
++# and a Windows desktop on separate runners are independent and worth running
++# side by side if you want to compare them.
+ concurrency:
+-  group: ubuntu-desktop
++  group: ${{ inputs.os == 'windows-11' && 'windows-vnc' || 'ubuntu-desktop' }}
+   cancel-in-progress: true
+ 
+ jobs:
+-  desktop:
++  linux:
+     name: Linux desktop
++    if: inputs.os != 'windows-11'
+     runs-on: ${{ inputs.runner }}
+     timeout-minutes: 360
+     permissions:
+@@ -321,4 +339,57 @@ jobs:
+ 
+       - name: Tear down
+         if: always()
+-        run: bash scripts/desktop.sh down || true
+\ No newline at end of file
++        run: bash scripts/desktop.sh down || true
++
++  windows:
++    name: Windows 11 desktop
++    if: inputs.os == 'windows-11'
++    runs-on: windows-11-arm
++    timeout-minutes: 360
++
++    env:
++      NOVNC_VERSION: v1.7.0
++      TIGHTVNC_URL: https://www.tightvnc.com/download/2.8.89/tightvnc-2.8.89-gpl-setup-64bit.msi
++      # cloudflared ships no arm64 Windows build, so this is the amd64 one
++      # running emulated.
++      CLOUDFLARED_URL: https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe
++      VNC_PORT: "5900"
++      HTTP_PORT: "6080"
++      VNC_PASSWORD_INPUT: ${{ inputs.password }}
++      SESSION_MINUTES: ${{ inputs.session_minutes }}
++      ALLOWED_EMAILS: ${{ inputs.allowed_emails }}
++
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Serve the desktop
++        id: serve
++        # One step on purpose: on Windows runners a process started with
++        # Start-Process is torn down when its step ends, which killed cloudflared
++        # and produced error 1033. The script starts everything and then holds
++        # the session open in this same step.
++        timeout-minutes: 360
++        shell: pwsh
++        run: pwsh ./scripts/windows-vnc.ps1
++
++      - name: Diagnostics
++        if: always()
++        shell: pwsh
++        env:
++          # The work directory the server script used, so this step can tail the
++          # pip, websockify and cloudflared logs inside it.
++          WINVNC_WORK: ${{ steps.serve.outputs.work_dir }}
++        run: pwsh ./scripts/windows-diagnostics.ps1
++
++      - name: Tear down
++        if: always()
++        shell: pwsh
++        run: |
++          foreach ($n in @('tvnserver')) {
++            Stop-Service -Name $n -Force -ErrorAction SilentlyContinue
++          }
++          Get-Process -Name 'cloudflared','python' -ErrorAction SilentlyContinue |
++            Where-Object { $_.Path -like "*$env:RUNNER_TEMP*" } |
++            Stop-Process -Force -ErrorAction SilentlyContinue
++          Write-Host "torn down"
+diff --git a/.github/workflows/windows-vnc.yml b/.github/workflows/windows-vnc.yml
+deleted file mode 100644
+index a1db4eb..0000000
+--- a/.github/workflows/windows-vnc.yml
++++ /dev/null
+@@ -1,85 +0,0 @@
+-name: Windows 11 VNC
+-
+-# Streams the desktop of a GitHub-hosted windows-11-arm runner into the browser.
+-#
+-# Proven viable by windows-probe.yml: that runner has a real interactive
+-# desktop (not just session 0), x86/x64 emulation works, and RDP is enabled.
+-#
+-# Chain:
+-#   TightVNC (captures the desktop) -> websockify (VNC -> WebSocket)
+-#     -> noVNC launcher page (browser client) -> cloudflared (public HTTPS)
+-#
+-# The work lives in scripts/windows-vnc.ps1. It is not inline because GitHub
+-# treats the whole run: body as a single expression and rejects it above 21000
+-# characters, which this script exceeds.
+-
+-on:
+-  workflow_dispatch:
+-    inputs:
+-      password:
+-        description: VNC password (blank = auto-generate)
+-        type: string
+-        required: false
+-      session_minutes:
+-        description: Session length in minutes (max 355)
+-        type: number
+-        default: 120
+-      allowed_emails:
+-        description: Restrict access with a Cloudflare one-time PIN
+-        type: string
+-        required: false
+-
+-permissions:
+-  contents: read
+-
+-concurrency:
+-  group: windows-vnc
+-  cancel-in-progress: true
+-
+-jobs:
+-  vnc:
+-    name: Windows 11 desktop
+-    runs-on: windows-11-arm
+-    timeout-minutes: 360
+-
+-    env:
+-      NOVNC_VERSION: v1.7.0
+-      TIGHTVNC_URL: https://www.tightvnc.com/download/2.8.89/tightvnc-2.8.89-gpl-setup-64bit.msi
+-      # cloudflared ships no arm64 Windows build, so this is the amd64 one
+-      # running emulated.
+-      CLOUDFLARED_URL: https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe
+-      VNC_PORT: "5900"
+-      HTTP_PORT: "6080"
+-      VNC_PASSWORD_INPUT: ${{ inputs.password }}
+-      SESSION_MINUTES: ${{ inputs.session_minutes }}
+-      ALLOWED_EMAILS: ${{ inputs.allowed_emails }}
+-
+-    steps:
+-      - name: Checkout
+-        uses: actions/checkout@v4
+-
+-      - name: Serve the desktop
+-        # One step on purpose: on Windows runners a process started with
+-        # Start-Process is torn down when its step ends, which killed cloudflared
+-        # and produced error 1033. The script starts everything and then holds
+-        # the session open in this same step.
+-        timeout-minutes: 360
+-        shell: pwsh
+-        run: pwsh ./scripts/windows-vnc.ps1
+-
+-      - name: Diagnostics
+-        if: always()
+-        shell: pwsh
+-        run: pwsh ./scripts/windows-diagnostics.ps1
+-
+-      - name: Tear down
+-        if: always()
+-        shell: pwsh
+-        run: |
+-          foreach ($n in @('tvnserver')) {
+-            Stop-Service -Name $n -Force -ErrorAction SilentlyContinue
+-          }
+-          Get-Process -Name 'cloudflared','python' -ErrorAction SilentlyContinue |
+-            Where-Object { $_.Path -like "*$env:RUNNER_TEMP*" } |
+-            Stop-Process -Force -ErrorAction SilentlyContinue
+-          Write-Host "torn down"
+\ No newline at end of file
+-- 
+2.56.0
+
+
+From 0822cb900818eb43c0a1daf4714f6f988cf332e2 Mon Sep 17 00:00:00 2001
+From: OpenCode <opencode@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 17:35:56 +0000
+Subject: [PATCH 2/2] readme: document the OS switch and the Mint flavor
+
+---
+ README.md | 94 ++++++++++++++++++++++++++++++++++++++++++-------------
+ 1 file changed, 73 insertions(+), 21 deletions(-)
+
+diff --git a/README.md b/README.md
+index ca02f31..3bbe2d2 100644
+--- a/README.md
++++ b/README.md
+@@ -1,13 +1,15 @@
+-# A Linux desktop in the browser, from GitHub Actions
++# A desktop in the browser, from GitHub Actions
+ 
+-Runs a real Linux desktop (XFCE by default, Ubuntu or Fedora or Debian or Arch)
+-on a GitHub-hosted runner and streams it to your browser over HTTPS. No VPS, no
++Runs a real desktop on a GitHub-hosted runner and streams it to your browser
++over HTTPS. Pick the OS in one workflow: **Linux Mint (Cinnamon)** by default —
++the option that looks like Windows and actually works — plus Ubuntu, Fedora,
++Debian or Arch flavors, or a **Windows 11** desktop (experimental). No VPS, no
+ port forwarding, no Cloudflare account.
+ 
+ ```
+-your browser ──HTTPS──> Cloudflare edge ──tunnel──> ubuntu-latest runner
++your browser ──HTTPS──> Cloudflare edge ──tunnel──> github-hosted runner
+                                                         └─ webtop:<flavor>
+-                                                           (XFCE + Selkies)
++                                                           (Cinnamon/Mint)
+ ```
+ 
+ ## How it works
+@@ -33,8 +35,9 @@ git init && git add -A && git commit -m "browser linux desktop"
+ gh repo create --private --source=. --push   # or push to any GitHub repo
+ ```
+ 
+-Then **Actions → Linux Desktop (browser VNC) → Run workflow**. The job summary
+-at the end of the run has the link and the password.
++Then **Actions → Browser Desktop (Linux or Windows) → Run workflow**. Pick the
++OS (`linux` or `windows-11`) and, for Linux, the `flavor`. The job summary at
++the end of the run has the link and the password.
+ 
+ Everything below is done by `scripts/desktop.sh` locally instead, if you'd
+ rather not go through Actions. `scripts/minecraft.sh` is separate — it's only
+@@ -48,22 +51,66 @@ includes a passwordless-sudo terminal.
+ 
+ | Input | Default | Notes |
+ |---|---|---|
+-| `flavor` | `ubuntu-xfce` | `fedora-xfce`, `debian-xfce`, `arch-xfce`, plus `-mate`/`-kde`/`-i3`/`-lxqt` variants |
++| `os` | `linux` | `windows-11` streams a separate TightVNC chain on a `windows-11-arm` runner instead; see [Windows 11](#windows-11) |
++| `flavor` | `mint-cinnamon` | Linux only. `mint-cinnamon` is Linux Mint's Cinnamon desktop (see below); also `ubuntu/fedora/debian/arch` × `xfce/mate/kde/i3` and `ubuntu-lxqt` |
+ | `session_minutes` | `240` | Hard-capped at 355, GitHub's job limit is 360 |
+ | `password` | *(blank)* | Blank uses the `VNC_PASSWORD` secret, else generates one |
+ | `allowed_emails` | *(blank)* | Cloudflare one-time-PIN gate. Needs a real address and an interactive browser |
+ | `mount_workspace` | `true` | Your checkout appears at `/config/workspace` |
+-| `cache_config` | `true` | Caches `/config` (XFCE settings, home files — **not** installed software) |
++| `cache_config` | `true` | Caches `/config` (desktop settings, home files — **not** installed software) |
+ | `software_render` | `true` | Force llvmpipe CPU rendering. Turn off only for real GPU hardware |
+ | `render_preset` | `balanced` | CPU render budget. Ignored when a real GPU is passed through |
+ | `resolution` | *(blank)* | Overrides the preset with an exact `WIDTHxHEIGHT`. Blank = use the preset |
+ | `save_packages` | `true` | Snapshot installed packages to `desktop-packages.txt` at job end |
++| `runner` | `ubuntu-latest` | Linux only. Use `"self-hosted, gpu"` for your own GPU box |
++| `gpu` | `none` | Linux only. `nvidia` or `amd` passthrough |
++| `wayland` | `false` | Linux only. Needed for real GPU rendering; **not supported by `mint-cinnamon`** |
++
++## Linux Mint (Cinnamon), the Windows-looking flavor
++
++LinuxServer ships no Mint image, and Mint publishes no docker image with a
++desktop on it. What makes Mint look like Windows is **Cinnamon** — its own
++desktop — and Cinnamon is packaged in Ubuntu's repositories for the exact
++release the webtop Ubuntu image is built on. So `mint-cinnamon` does the
++obvious thing at build time:
++
++```
++lscr.io/linuxserver/webtop:ubuntu-xfce      # published base, pulled each run
++  + cinnamon-desktop-environment            # the Mint desktop
++  + /defaults/startwm.sh -> cinnamon-session  # what actually starts it
++```
++
++Details worth knowing:
++
++- **Built per run.** The derived image (`lscr.io/linuxserver/webtop:mint-cinnamon`
++  as a local tag) is built at the start of each session. The Cinnamon install
++  adds a few minutes and ~1 GB of download — only paid on `up`.
++- **The desktop switch is one file.** Each webtop flavor hardcodes its session
++  in `/defaults/startwm.sh`, which the image's init execs on every **boot** and
++  never copies into the persistent `/config`, so a cached config volume cannot
++  resurrect XFCE under a running Cinnamon session. The swap lives in
++  [`scripts/mint-cinnamon.Dockerfile`](scripts/mint-cinnamon.Dockerfile).
++- **No Wayland.** Cinnamon has no supported Wayland mode here, so enabling the
++  `wayland` input with this flavor still starts the X11 session (logged as a
++  warning). Wayland is only ever needed for real GPU passthrough, which is a
++  separate concern from this CPU-rendered flavor.
++- **`desktop-packages.txt` is distro-specific by nature.** The current manifest
++  holds Fedora rpm names, so a Mint run fails to restore them (logged as a
++  warning, the desktop still works). The first Mint snapshot rewrite the file
++  with Mint's `dpkg` names; commit history keeps the Fedora list if you switch
++  back.
++
++Everything else — password, tunnel, render presets, keep-alive — is the same
++code path as the stock flavors.
+ 
+ ## Windows 11
+ 
+-Windows is a **separate workflow**, because Windows containers cannot do this at
+-all: they are Nano Server or Server Core and contain **no GUI stack** — no DWM,
+-no WPF, no shell.
++**Experimental — selected with `os: windows-11`** in the same workflow; it is a
++separate *job* because a Windows desktop needs a different runner (`windows-11-arm`)
++and a different toolchain entirely: Windows containers are Nano Server or
++Server Core and contain **no GUI stack** — no DWM, no WPF, no shell. The old
++standalone Windows workflow was folded into [`desktop.yml`](.github/workflows/desktop.yml);
++its behavior did not change.
+ 
+ There is a **feasibility probe** that settles whether streaming is possible,
+ without downloading anything, so a failure is a real signal rather than a bad
+@@ -77,7 +124,8 @@ Actions → **Windows 11 feasibility probe** → **Run workflow**.
+ | `BLOCKED: no interactive desktop` | Any VNC server captures a black screen |
+ | `BLOCKED: no x86 emulation` | No tunnelling binary can run either |
+ 
+-When the probe says `VIABLE`, run **Windows 11 VNC**. The chain is:
++When the probe says `VIABLE`, run the main workflow with `os: windows-11`. The
++chain is:
+ 
+ ```
+ TightVNC (captures the desktop)
+@@ -103,10 +151,13 @@ guessing paths earlier returned 404.
+   workflow and round-trip tested locally.
+ - TightVNC binds to **loopback only**, so the runner's network cannot reach 5900.
+   The tunnel is the only way in.
+-- The whole chain is **untested on a real `windows-11-arm` runner** — none was
+-  available locally. The PowerShell parses and the crypto is verified, but the
+-  TightVNC install and noVNC handshake have never run end to end. Expect to
+-  iterate.
++- The whole chain is **untested on a real `windows-11-arm` runner in this
++  repository** — it has not been dispatched even once, which is why it is
++  marked experimental and why Mint's Cinnamon is the recommended Windows-look
++  option. The PowerShell parses and the crypto is verified, but the TightVNC
++  install and noVNC handshake have never run end to end. Expect to iterate.
++- The first `windows-11-arm` attempt should be the **feasibility probe** above:
++  it settles runner viability in ~2 minutes without installing anything.
+ - **websockify is installed with `--no-deps`, deliberately.** Its dependency
+   chain reaches `cryptography`, which publishes **no `win_arm64` wheels at all**,
+   so a normal install tries to compile it from Rust source via maturin/cargo and
+@@ -129,8 +180,8 @@ Same script, no Actions. Useful for debugging a failure before you burn CI
+ minutes.
+ 
+ ```bash
+-export FLAVOR=fedora-xfce CONFIG_DIR="$PWD/.desktop-config"
+-./scripts/desktop.sh up         # starts the container, waits until healthy
++export FLAVOR=mint-cinnamon CONFIG_DIR="$PWD/.desktop-config"
++./scripts/desktop.sh up         # builds the Mint image if needed, starts the container
+ ./scripts/desktop.sh tunnel     # prints a public https:// URL
+ ./scripts/desktop.sh shell      # terminal inside the desktop
+ ./scripts/desktop.sh glinfo     # confirm llvmpipe / Vulkan ICD
+@@ -139,8 +190,9 @@ export FLAVOR=fedora-xfce CONFIG_DIR="$PWD/.desktop-config"
+ ./scripts/desktop.sh down
+ ```
+ 
+-The first run pulls ~1.2 GB and takes a few minutes. Needs a recent Docker;
+-no `--privileged` and no GPU required.
++The first run downloads the base image (~1.6 GB); `mint-cinnamon` then builds
++on top of it, which adds roughly another 1 GB for Cinnamon. Needs a recent
++Docker; no `--privileged` and no GPU required.
+ 
+ ## Latency
+ 
+-- 
+2.56.0
+
