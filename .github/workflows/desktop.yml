@@ -1,20 +1,35 @@
-name: Linux Desktop (browser VNC)
+name: Browser Desktop (Linux or Windows)
 
-# Spins up a real Linux desktop (XFCE by default) on a GitHub-hosted runner and
-# streams it to your browser over HTTPS. The runner has no inbound ports, so the
-# desktop is published through a Cloudflare Quick Tunnel, which needs no account.
+# One dispatch, one OS picker: stream a Linux desktop (Mint's Cinnamon by
+# default, or Ubuntu/Fedora/Debian/Arch flavors) OR a Windows 11 desktop to the
+# browser over HTTPS. The runner has no inbound ports, so the desktop is
+# published through a Cloudflare Quick Tunnel, which needs no account.
 #
 # The session is ephemeral: it dies when the job ends or you cancel it, and the
 # public URL stops working at that moment.
+#
+# The two jobs below mirror that switch: only one runs, chosen by the `os`
+# input. They could not share a runner — one needs Windows and dockerd, the
+# other Docker and a Linux GUI stack — so the split is structural, not cosmetic.
 
 on:
   workflow_dispatch:
     inputs:
-      flavor:
-        description: Distro and desktop flavor
+      os:
+        description: Desktop operating system
         type: choice
-        default: fedora-xfce
+        default: linux
         options:
+          - linux
+          - windows-11
+      flavor:
+        description: Linux distro and desktop flavor (ignored for Windows)
+        type: choice
+        default: mint-cinnamon
+        options:
+          # Linux Mint's desktop: the closest Windows-like option that works on
+          # these runners. Built on the fly from scripts/mint-cinnamon.Dockerfile.
+          - mint-cinnamon
           - ubuntu-xfce
           - ubuntu-mate
           - ubuntu-kde
@@ -75,7 +90,7 @@ on:
         type: boolean
         default: true
       runner:
-        description: Runner label. Use "self-hosted, gpu" for your own GPU box
+        description: Runner label for Linux. Use "self-hosted, gpu" for your own GPU box
         type: string
         default: ubuntu-latest
       gpu:
@@ -94,14 +109,17 @@ on:
 permissions:
   contents: read
 
-# One desktop at a time; a second run would fight over the same ports.
+# Cancel in progress, but keep Linux and Windows groups apart: a Linux desktop
+# and a Windows desktop on separate runners are independent and worth running
+# side by side if you want to compare them.
 concurrency:
-  group: ubuntu-desktop
+  group: ${{ inputs.os == 'windows-11' && 'windows-vnc' || 'ubuntu-desktop' }}
   cancel-in-progress: true
 
 jobs:
-  desktop:
+  linux:
     name: Linux desktop
+    if: inputs.os != 'windows-11'
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 360
     permissions:
@@ -322,3 +340,56 @@ jobs:
       - name: Tear down
         if: always()
         run: bash scripts/desktop.sh down || true
+
+  windows:
+    name: Windows 11 desktop
+    if: inputs.os == 'windows-11'
+    runs-on: windows-11-arm
+    timeout-minutes: 360
+
+    env:
+      NOVNC_VERSION: v1.7.0
+      TIGHTVNC_URL: https://www.tightvnc.com/download/2.8.89/tightvnc-2.8.89-gpl-setup-64bit.msi
+      # cloudflared ships no arm64 Windows build, so this is the amd64 one
+      # running emulated.
+      CLOUDFLARED_URL: https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe
+      VNC_PORT: "5900"
+      HTTP_PORT: "6080"
+      VNC_PASSWORD_INPUT: ${{ inputs.password }}
+      SESSION_MINUTES: ${{ inputs.session_minutes }}
+      ALLOWED_EMAILS: ${{ inputs.allowed_emails }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Serve the desktop
+        id: serve
+        # One step on purpose: on Windows runners a process started with
+        # Start-Process is torn down when its step ends, which killed cloudflared
+        # and produced error 1033. The script starts everything and then holds
+        # the session open in this same step.
+        timeout-minutes: 360
+        shell: pwsh
+        run: pwsh ./scripts/windows-vnc.ps1
+
+      - name: Diagnostics
+        if: always()
+        shell: pwsh
+        env:
+          # The work directory the server script used, so this step can tail the
+          # pip, websockify and cloudflared logs inside it.
+          WINVNC_WORK: ${{ steps.serve.outputs.work_dir }}
+        run: pwsh ./scripts/windows-diagnostics.ps1
+
+      - name: Tear down
+        if: always()
+        shell: pwsh
+        run: |
+          foreach ($n in @('tvnserver')) {
+            Stop-Service -Name $n -Force -ErrorAction SilentlyContinue
+          }
+          Get-Process -Name 'cloudflared','python' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -like "*$env:RUNNER_TEMP*" } |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+          Write-Host "torn down"
