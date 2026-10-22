@@ -22,9 +22,26 @@ warn() { printf '\033[33m!!\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31mxx\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ---------------------------------------------------------------- config ----
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
 IMAGE_REPO="${IMAGE_REPO:-lscr.io/linuxserver/webtop}"
 FLAVOR="${FLAVOR:-fedora-xfce}"
 CONTAINER="${CONTAINER:-ubuntu-desktop}"
+
+# What we actually run. Resolved inside cmd_up (derived flavors are built as a
+# local tag rather than pulled) and recorded in state.env so later steps such
+# as the tunnel here and the job summary there report the truthful name.
+IMAGE=""
+
+# Flavors that are not published upstream as an image tag. Mint is the case:
+# LinuxServer ships no Mint image, so mint-cinnamon derives their published
+# Ubuntu image with Cinnamon (the Mint desktop) added. Each entry names a
+# Dockerfile under scripts/; the build happens in cmd_up before any run.
+flavor_dockerfile() {
+  case "$FLAVOR" in
+    mint-cinnamon) echo "$SCRIPT_DIR/mint-cinnamon.Dockerfile" ;;
+    *)             echo "" ;;
+  esac
+}
 
 VNC_USER="${VNC_USER:-dev}"
 PASSWORD="${PASSWORD:-}"
@@ -176,8 +193,10 @@ host_path() {
 
 save_state() {
   mkdir -p "$STATE_DIR"
+  # Fallback for any path that saves before cmd_up resolved the real image.
+  if [[ -z "$IMAGE" ]]; then IMAGE="$IMAGE_REPO:$FLAVOR"; fi
   {
-    printf 'IMAGE=%q\n'     "$IMAGE_REPO:$FLAVOR"
+    printf 'IMAGE=%q\n'     "$IMAGE"
     printf 'CONTAINER=%q\n'  "$CONTAINER"
     printf 'VNC_USER=%q\n'   "$VNC_USER"
     printf 'PASSWORD=%q\n'   "$PASSWORD"
@@ -229,6 +248,25 @@ cmd_up() {
   [[ -n "$PASSWORD" ]] || PASSWORD="$(gen_password)"
 
   local image="$IMAGE_REPO:$FLAVOR"
+  local dockerfile; dockerfile="$(flavor_dockerfile)"
+  IMAGE="$image"
+
+  # The Dockerfile FROM is hardcoded to the published Ubuntu tag, so the same
+  # tag has to be pre-pulled: without --pull the build reuses whatever is
+  # local, which may be stale or absent, and that is not deterministic.
+  local base_tag="lscr.io/linuxserver/webtop:ubuntu-xfce"
+
+  if [[ -n "$dockerfile" ]]; then
+    [[ -f "$dockerfile" ]] || die "derived flavor '$FLAVOR' has no Dockerfile at $dockerfile"
+    log "pulling $base_tag (base of the $FLAVOR build)"
+    docker pull --quiet "$base_tag" >/dev/null
+    log "building $image from $(basename "$dockerfile") (the Cinnamon install adds a few minutes)"
+    docker build -f "$dockerfile" -t "$image" "$SCRIPT_DIR/.." >&2 || die "build failed for $FLAVOR"
+  else
+    log "pulling $image"
+    docker pull --quiet "$image" >/dev/null
+  fi
+
   mkdir -p "$STATE_DIR"
 
   # Any leftover blocks the name, not just a running one. A container left in
@@ -237,9 +275,6 @@ cmd_up() {
     log "removing existing container '$CONTAINER'"
     docker rm -f "$CONTAINER" >/dev/null
   fi
-
-  log "pulling $image"
-  docker pull --quiet "$image" >/dev/null
 
   local -a args=(
     -d
