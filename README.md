@@ -1,13 +1,15 @@
-# A Linux desktop in the browser, from GitHub Actions
+# A desktop in the browser, from GitHub Actions
 
-Runs a real Linux desktop (XFCE by default, Ubuntu or Fedora or Debian or Arch)
-on a GitHub-hosted runner and streams it to your browser over HTTPS. No VPS, no
+Runs a real desktop on a GitHub-hosted runner and streams it to your browser
+over HTTPS. Pick the OS in one workflow: **Linux Mint (Cinnamon)** by default —
+the option that looks like Windows and actually works — plus Ubuntu, Fedora,
+Debian or Arch flavors, or a **Windows 11** desktop (experimental). No VPS, no
 port forwarding, no Cloudflare account.
 
 ```
-your browser ──HTTPS──> Cloudflare edge ──tunnel──> ubuntu-latest runner
+your browser ──HTTPS──> Cloudflare edge ──tunnel──> github-hosted runner
                                                         └─ webtop:<flavor>
-                                                           (XFCE + Selkies)
+                                                           (Cinnamon/Mint)
 ```
 
 ## How it works
@@ -33,8 +35,9 @@ git init && git add -A && git commit -m "browser linux desktop"
 gh repo create --private --source=. --push   # or push to any GitHub repo
 ```
 
-Then **Actions → Linux Desktop (browser VNC) → Run workflow**. The job summary
-at the end of the run has the link and the password.
+Then **Actions → Browser Desktop (Linux or Windows) → Run workflow**. Pick the
+OS (`linux` or `windows-11`) and, for Linux, the `flavor`. The job summary at
+the end of the run has the link and the password.
 
 Everything below is done by `scripts/desktop.sh` locally instead, if you'd
 rather not go through Actions. `scripts/minecraft.sh` is separate — it's only
@@ -48,22 +51,66 @@ includes a passwordless-sudo terminal.
 
 | Input | Default | Notes |
 |---|---|---|
-| `flavor` | `ubuntu-xfce` | `fedora-xfce`, `debian-xfce`, `arch-xfce`, plus `-mate`/`-kde`/`-i3`/`-lxqt` variants |
+| `os` | `linux` | `windows-11` streams a separate TightVNC chain on a `windows-11-arm` runner instead; see [Windows 11](#windows-11) |
+| `flavor` | `mint-cinnamon` | Linux only. `mint-cinnamon` is Linux Mint's Cinnamon desktop (see below); also `ubuntu/fedora/debian/arch` × `xfce/mate/kde/i3` and `ubuntu-lxqt` |
 | `session_minutes` | `240` | Hard-capped at 355, GitHub's job limit is 360 |
 | `password` | *(blank)* | Blank uses the `VNC_PASSWORD` secret, else generates one |
 | `allowed_emails` | *(blank)* | Cloudflare one-time-PIN gate. Needs a real address and an interactive browser |
 | `mount_workspace` | `true` | Your checkout appears at `/config/workspace` |
-| `cache_config` | `true` | Caches `/config` (XFCE settings, home files — **not** installed software) |
+| `cache_config` | `true` | Caches `/config` (desktop settings, home files — **not** installed software) |
 | `software_render` | `true` | Force llvmpipe CPU rendering. Turn off only for real GPU hardware |
 | `render_preset` | `balanced` | CPU render budget. Ignored when a real GPU is passed through |
 | `resolution` | *(blank)* | Overrides the preset with an exact `WIDTHxHEIGHT`. Blank = use the preset |
 | `save_packages` | `true` | Snapshot installed packages to `desktop-packages.txt` at job end |
+| `runner` | `ubuntu-latest` | Linux only. Use `"self-hosted, gpu"` for your own GPU box |
+| `gpu` | `none` | Linux only. `nvidia` or `amd` passthrough |
+| `wayland` | `false` | Linux only. Needed for real GPU rendering; **not supported by `mint-cinnamon`** |
+
+## Linux Mint (Cinnamon), the Windows-looking flavor
+
+LinuxServer ships no Mint image, and Mint publishes no docker image with a
+desktop on it. What makes Mint look like Windows is **Cinnamon** — its own
+desktop — and Cinnamon is packaged in Ubuntu's repositories for the exact
+release the webtop Ubuntu image is built on. So `mint-cinnamon` does the
+obvious thing at build time:
+
+```
+lscr.io/linuxserver/webtop:ubuntu-xfce      # published base, pulled each run
+  + cinnamon-desktop-environment            # the Mint desktop
+  + /defaults/startwm.sh -> cinnamon-session  # what actually starts it
+```
+
+Details worth knowing:
+
+- **Built per run.** The derived image (`lscr.io/linuxserver/webtop:mint-cinnamon`
+  as a local tag) is built at the start of each session. The Cinnamon install
+  adds a few minutes and ~1 GB of download — only paid on `up`.
+- **The desktop switch is one file.** Each webtop flavor hardcodes its session
+  in `/defaults/startwm.sh`, which the image's init execs on every **boot** and
+  never copies into the persistent `/config`, so a cached config volume cannot
+  resurrect XFCE under a running Cinnamon session. The swap lives in
+  [`scripts/mint-cinnamon.Dockerfile`](scripts/mint-cinnamon.Dockerfile).
+- **No Wayland.** Cinnamon has no supported Wayland mode here, so enabling the
+  `wayland` input with this flavor still starts the X11 session (logged as a
+  warning). Wayland is only ever needed for real GPU passthrough, which is a
+  separate concern from this CPU-rendered flavor.
+- **`desktop-packages.txt` is distro-specific by nature.** The current manifest
+  holds Fedora rpm names, so a Mint run fails to restore them (logged as a
+  warning, the desktop still works). The first Mint snapshot rewrite the file
+  with Mint's `dpkg` names; commit history keeps the Fedora list if you switch
+  back.
+
+Everything else — password, tunnel, render presets, keep-alive — is the same
+code path as the stock flavors.
 
 ## Windows 11
 
-Windows is a **separate workflow**, because Windows containers cannot do this at
-all: they are Nano Server or Server Core and contain **no GUI stack** — no DWM,
-no WPF, no shell.
+**Experimental — selected with `os: windows-11`** in the same workflow; it is a
+separate *job* because a Windows desktop needs a different runner (`windows-11-arm`)
+and a different toolchain entirely: Windows containers are Nano Server or
+Server Core and contain **no GUI stack** — no DWM, no WPF, no shell. The old
+standalone Windows workflow was folded into [`desktop.yml`](.github/workflows/desktop.yml);
+its behavior did not change.
 
 There is a **feasibility probe** that settles whether streaming is possible,
 without downloading anything, so a failure is a real signal rather than a bad
@@ -77,7 +124,8 @@ Actions → **Windows 11 feasibility probe** → **Run workflow**.
 | `BLOCKED: no interactive desktop` | Any VNC server captures a black screen |
 | `BLOCKED: no x86 emulation` | No tunnelling binary can run either |
 
-When the probe says `VIABLE`, run **Windows 11 VNC**. The chain is:
+When the probe says `VIABLE`, run the main workflow with `os: windows-11`. The
+chain is:
 
 ```
 TightVNC (captures the desktop)
@@ -103,10 +151,13 @@ guessing paths earlier returned 404.
   workflow and round-trip tested locally.
 - TightVNC binds to **loopback only**, so the runner's network cannot reach 5900.
   The tunnel is the only way in.
-- The whole chain is **untested on a real `windows-11-arm` runner** — none was
-  available locally. The PowerShell parses and the crypto is verified, but the
-  TightVNC install and noVNC handshake have never run end to end. Expect to
-  iterate.
+- The whole chain is **untested on a real `windows-11-arm` runner in this
+  repository** — it has not been dispatched even once, which is why it is
+  marked experimental and why Mint's Cinnamon is the recommended Windows-look
+  option. The PowerShell parses and the crypto is verified, but the TightVNC
+  install and noVNC handshake have never run end to end. Expect to iterate.
+- The first `windows-11-arm` attempt should be the **feasibility probe** above:
+  it settles runner viability in ~2 minutes without installing anything.
 - **websockify is installed with `--no-deps`, deliberately.** Its dependency
   chain reaches `cryptography`, which publishes **no `win_arm64` wheels at all**,
   so a normal install tries to compile it from Rust source via maturin/cargo and
@@ -129,8 +180,8 @@ Same script, no Actions. Useful for debugging a failure before you burn CI
 minutes.
 
 ```bash
-export FLAVOR=fedora-xfce CONFIG_DIR="$PWD/.desktop-config"
-./scripts/desktop.sh up         # starts the container, waits until healthy
+export FLAVOR=mint-cinnamon CONFIG_DIR="$PWD/.desktop-config"
+./scripts/desktop.sh up         # builds the Mint image if needed, starts the container
 ./scripts/desktop.sh tunnel     # prints a public https:// URL
 ./scripts/desktop.sh shell      # terminal inside the desktop
 ./scripts/desktop.sh glinfo     # confirm llvmpipe / Vulkan ICD
@@ -139,8 +190,9 @@ export FLAVOR=fedora-xfce CONFIG_DIR="$PWD/.desktop-config"
 ./scripts/desktop.sh down
 ```
 
-The first run pulls ~1.2 GB and takes a few minutes. Needs a recent Docker;
-no `--privileged` and no GPU required.
+The first run downloads the base image (~1.6 GB); `mint-cinnamon` then builds
+on top of it, which adds roughly another 1 GB for Cinnamon. Needs a recent
+Docker; no `--privileged` and no GPU required.
 
 ## Latency
 
